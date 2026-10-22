@@ -127,7 +127,14 @@ const camera = {
         );
         const ticks = (await page.evaluate(() => window.__ticks)) - ticksBefore;
         assert.ok(ticks <= 16, `5-FPS scheduler woke ${ticks} times in 2.2 seconds`);
-        console.log('camera scheduler', { ticks, requests: frames - before });
+        const displayedFps = parseFloat(await page.locator('#camera1 .camera-fps span').textContent());
+        assert.ok(
+            displayedFps >= 4 && displayedFps <= 5.5,
+            `FPS display matches delivered frames: ${displayedFps}`,
+        );
+        const ratio = await page.evaluate(() => cameraFrameRatios[1]);
+        assert.equal(ratio, 720 / 1280, 'layout ratio updates when a frame loads');
+        console.log('camera scheduler', { ticks, requests: frames - before, displayedFps });
         await page.evaluate(() => doSingleViewCamera(1));
         await page.waitForTimeout(400);
         const otherCameraRequests = requestsByCamera[2];

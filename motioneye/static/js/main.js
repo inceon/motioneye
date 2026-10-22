@@ -4707,6 +4707,7 @@ function addCameraFrameUi(cameraConfig) {
 
     cameraFrameDiv.attr('id', 'camera' + cameraId);
     cameraFrameDiv[0].config = cameraConfig;
+    cameraFrameRatios[cameraId] = 1;
     nameSpan.text(cameraConfig.name);
     progressImg.attr('src', staticPath + 'img/camera-progress.gif');
 
@@ -4978,6 +4979,14 @@ function addCameraFrameUi(cameraConfig) {
             this._naturalHeight = this.naturalHeight;
         }
 
+        var ratio = this._naturalHeight / this._naturalWidth;
+        if (ratio > 0 && cameraFrameRatios[cameraId] != ratio) {
+            cameraFrameRatios[cameraId] = ratio;
+            if (!this.initializing) {
+                updateLayout();
+            }
+        }
+
         if (this.initializing) {
             cameraProgress.removeClass('visible');
             cameraImg.removeClass('initializing');
@@ -5010,7 +5019,7 @@ function addCameraFrameUi(cameraConfig) {
             this.lastCookieTime = now;
 
             if (this.fpsTimes.length == FPS_LEN) {
-                var streamingFps = this.fpsTimes.length * 1000 / (this.fpsTimes[this.fpsTimes.length - 1] - this.fpsTimes[0]);
+                var streamingFps = (this.fpsTimes.length - 1) * 1000 / (this.fpsTimes[this.fpsTimes.length - 1] - this.fpsTimes[0]);
                 streamingFps = streamingFps.toFixed(1);
 
                 var fps = streamingFps;
@@ -5371,8 +5380,6 @@ function refreshCameraFrames(timestamp) {
             }, timestamp);
             nextRefresh = Math.min(nextRefresh, delay);
         }
-
-        cameraFrameRatios[cameraId] = this.img.naturalWidth > 0 ? this.img.naturalHeight / this.img.naturalWidth : 1;
     });
 
     return Math.max(refreshInterval, nextRefresh);
