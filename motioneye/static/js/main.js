@@ -3393,9 +3393,13 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
     var img = $('<img class="picture-dialog-content">');
     content.append(img);
 
-    var video_container = $('<video id="mPlayer" class="picture-dialog-content" controls="true">');
-    var video_loader = $('<img>');
+    var video_container = $('<video id="mPlayer" class="picture-dialog-content" controls="true" preload="none" playsinline>');
+    var previewTimer;
     video_container.on('error', function(err) {
+        if (!err.target.error) {
+            return;
+        }
+        progressImg.remove();
         var msg = '';
 
         /* Reference: https://html.spec.whatwg.org/multipage/embedded-content.html#error-codes */
@@ -3438,7 +3442,18 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
     content.append(nextArrow);
     var progressImg = $('<div class="picture-dialog-progress">');
 
+    function stopVideo() {
+        video_container.off('canplay.pictureDialog ended.pictureDialog');
+        var video = video_container.get(0);
+        video.pause();
+        video.removeAttribute('src');
+        video.preload = 'none';
+        video.load();
+    }
+
     function updatePicture() {
+        stopVideo();
+        clearTimeout(previewTimer);
         var entry = entries[pos];
 
         var windowWidth = $(window).width();
@@ -3449,8 +3464,8 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         var width = parseInt(windowWidth * widthCoef);
         var height = parseInt(windowHeight * heightCoef);
 
-        prevArrow.css('display', 'none');
-        nextArrow.css('display', 'none');
+        prevArrow.css('display', pos < entries.length - 1 ? '' : 'none');
+        nextArrow.css('display', pos > 0 ? '' : 'none');
 
         var playable = video_container.get(0).canPlayType(entry.mimeType) != '';
         timelapseButton.hide();
@@ -3461,15 +3476,13 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         img.parent().append(progressImg);
         updateModalDialogPosition();
 
-        img.attr('src', basePath + mediaType + '/' + entry.cameraId + '/preview' + entry.path);
-
         if (playable) {
-            video_loader.attr('src', basePath + mediaType + '/' + entry.cameraId + '/playback' + entry.path);
             playButton.show();
             timelapseButton.show();
         }
 
-        img.on('load', function () {
+        img.off('.pictureDialog').one('load.pictureDialog', function () {
+            clearTimeout(previewTimer);
             var aspectRatio = this.naturalWidth / this.naturalHeight;
             var sizeWidth = width * width / aspectRatio;
             var sizeHeight = height * aspectRatio * height;
@@ -3491,6 +3504,16 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
             progressImg.remove();
         });
 
+        function previewFailed() {
+            clearTimeout(previewTimer);
+            progressImg.remove();
+            img.off('.pictureDialog').attr('src', staticPath + 'img/no-preview.svg');
+            updateModalDialogPosition();
+        }
+        img.one('error.pictureDialog', previewFailed);
+        previewTimer = setTimeout(previewFailed, 15000);
+        img.attr('src', basePath + mediaType + '/' + entry.cameraId + '/preview' + entry.path);
+
         modalContainer.find('span.modal-title:last').text(entry.name);
         updateModalDialogPosition();
     }
@@ -3502,15 +3525,21 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         if (video_container.get(0).canPlayType(entry.mimeType) == '') {
             return;  /* the timelapse chain may trigger this on a non-playable entry */
         }
-        video_container.attr('src', basePath + mediaType + '/' + entry.cameraId + '/playback' + entry.path);
+        clearTimeout(previewTimer);
+        progressImg.remove();
         video_container.show();
-        video_container.get(0).load();  /* Must call load() after changing <video> source */
         img.hide();
         playButton.hide();
         timelapseButton.hide();
         video_container.off('canplay.pictureDialog').one('canplay.pictureDialog', function() {
-           video_container.get(0).play();  /* Automatically play the video once the browser is ready */
+            var promise = video_container.get(0).play();
+            if (promise) {
+                promise.catch(function () { /* Native controls allow manual playback. */ });
+            }
         });
+        video_container.attr('preload', 'auto');
+        video_container.attr('src', basePath + mediaType + '/' + entry.cameraId + '/playback' + entry.path);
+        video_container.get(0).load();
     });
 
     timelapseButton.on('click', function() {
@@ -3519,8 +3548,7 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         video_container.off('ended.pictureDialog').on('ended.pictureDialog', function() {
             if (pos > 0) {
                 nextArrow.trigger('click');
-                playButton.trigger('click');
-                video_container.get(0).playbackRate = 5;
+                timelapseButton.trigger('click');
             }
         });
     });
@@ -3602,6 +3630,9 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         stack: true,
         onShow: updatePicture,
         onClose: function () {
+            stopVideo();
+            clearTimeout(previewTimer);
+            img.off('.pictureDialog').removeAttr('src');
             $('body').off('keydown', bodyKeyDown);
         }
     });

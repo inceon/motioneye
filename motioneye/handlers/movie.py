@@ -18,9 +18,11 @@
 from __future__ import annotations
 
 import logging
-from asyncio import get_running_loop
+from asyncio import Lock, get_running_loop
+from functools import partial
 from os.path import join
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from tornado.web import HTTPError
 
@@ -28,6 +30,8 @@ from motioneye import config, mediafiles, remote, settings, utils
 from motioneye.handlers.base import BaseHandler
 
 __all__ = ('MovieHandler',)
+
+_preview_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
 
 
 class MovieHandler(BaseHandler):
@@ -162,13 +166,20 @@ class MovieHandler(BaseHandler):
 
         camera_config = config.get_camera(camera_id)
         if utils.is_local_motion_camera(camera_config):
-            content = mediafiles.get_media_preview(
-                camera_config,
-                filename,
-                'movie',
-                width=self.get_argument('width', None),
-                height=self.get_argument('height', None),
-            )
+            path = mediafiles.get_media_path(camera_config, filename)
+            lock = _preview_locks.setdefault(path, Lock())
+            async with lock:
+                content = await get_running_loop().run_in_executor(
+                    None,
+                    partial(
+                        mediafiles.get_media_preview,
+                        camera_config,
+                        filename,
+                        'movie',
+                        width=self.get_argument('width', None),
+                        height=self.get_argument('height', None),
+                    ),
+                )
 
         elif utils.is_remote_camera(camera_config):
             resp = await remote.get_media_preview(
