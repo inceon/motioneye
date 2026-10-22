@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from tornado.web import StaticFileHandler
 
 from motioneye import settings
 from motioneye.utils.dtconv import (
@@ -25,6 +26,10 @@ from motioneye.utils.dtconv import (
 )
 
 _jinja_env = None
+
+
+def static_version(path):
+    return StaticFileHandler.get_version({'static_path': settings.STATIC_PATH}, path)
 
 
 def _init_jinja():
@@ -39,6 +44,7 @@ def _init_jinja():
 
     # globals
     _jinja_env.globals['settings'] = settings
+    _jinja_env.globals['static_version'] = static_version
 
     # filters
     _jinja_env.filters['pretty_date_time'] = pretty_date_time

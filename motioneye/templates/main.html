@@ -14,7 +14,7 @@
 {% block script %}
     {{super()}}
     <script defer src="{{static_path}}js/ui.js?v={{version}}"></script>
-    <script defer src="{{static_path}}js/main.js?v={{version}}"></script>
+    <script defer src="{{static_path}}js/main.js?v={{static_version('js/main.js')}}"></script>
     {% if frame %}
         <script defer src="{{static_path}}js/frame.js?v={{version}}"></script>
     {% endif %}
