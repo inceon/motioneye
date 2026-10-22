@@ -130,47 +130,40 @@ function makeSlider($input, minVal, maxVal, snapMode, ticks, ticksNumber, decima
             cursorLabel.html('' + val.toFixed(decimals) + unit);
         }
 
-        function bodyMouseMove(e) {
-            if (bar[0]._mouseDown) {
-                var offset = bar.offset();
-                var pos = e.pageX - offset.left - 5;
-                pos = pos / slider.width() * 100;
-                pos = bestPos(pos);
-                var val = posToVal(pos);
+        var activePointer = null;
 
-                cursor.css('left', pos + '%');
-                sliderChange(val);
-            }
+        function movePointer(e) {
+            var offset = bar.offset();
+            var pos = bestPos((e.pageX - offset.left - 5) / slider.width() * 100);
+            cursor.css('left', pos + '%');
+            sliderChange(posToVal(pos));
         }
 
-        function bodyMouseUp(e) {
-            bar[0]._mouseDown = false;
-
-            $('body').off('mousemove', bodyMouseMove);
-            $('body').off('mouseup', bodyMouseUp);
-
-            cursorLabel.css('display', 'none');
-            adjusting = false;
-
-            $this.trigger('change');
-        }
-
-        bar.mousedown(function (e) {
-            if (e.which > 1) {
+        bar.on('pointerdown', function (e) {
+            if (!e.originalEvent.isPrimary || e.button > 0) {
                 return;
             }
-
-            this._mouseDown = true;
-            bodyMouseMove(e);
-
-            $('body').mousemove(bodyMouseMove);
-            $('body').mouseup(bodyMouseUp);
-
-            slider.focus();
-            cursorLabel.css('display', 'inline-block');
+            activePointer = e.originalEvent.pointerId;
+            this.setPointerCapture(activePointer);
             adjusting = true;
-
-            return false;
+            slider[0].focus({preventScroll: true});
+            cursorLabel.css('display', 'inline-block');
+            movePointer(e);
+            e.preventDefault();
+        });
+        bar.on('pointermove', function (e) {
+            if (e.originalEvent.pointerId === activePointer) {
+                movePointer(e);
+            }
+        });
+        bar.on('pointerup pointercancel lostpointercapture', function (e) {
+            if (e.originalEvent.pointerId !== activePointer) {
+                return;
+            }
+            activePointer = null;
+            cursorLabel.css('display', 'none');
+            adjusting = false;
+            $this.trigger('change');
         });
 
         /* ticks */
@@ -592,18 +585,18 @@ function updateModalDialogPosition() {
         return;
     }
 
-    var windowWidth = $(window).width();
-    var windowHeight = $(window).height();
-    var modalWidth, modalHeight, i;
+    var viewport = window.visualViewport;
+    var windowWidth = viewport ? viewport.width : $(window).width();
+    var windowHeight = viewport ? viewport.height : $(window).height();
+    var offsetLeft = viewport ? viewport.offsetLeft : 0;
+    var offsetTop = viewport ? viewport.offsetTop : 0;
 
-    /* repeat the operation multiple times, the size might change */
-    for (i = 0; i < 3; i++) {
-        modalWidth = container.outerWidth();
-        modalHeight = container.outerHeight();
-
-        container.css('left', Math.floor((windowWidth - modalWidth) / 2));
-        container.css('top', Math.floor((windowHeight - modalHeight) / 2));
-    }
+    /* Keep the dialog reachable when a phone keyboard reduces the viewport. */
+    container.css('max-height', Math.max(0, windowHeight - 16));
+    container.css({
+        left: offsetLeft + Math.max(8, Math.floor((windowWidth - container.outerWidth()) / 2)),
+        top: offsetTop + Math.max(8, Math.floor((windowHeight - container.outerHeight()) / 2))
+    });
 }
 
 function makeModalDialogButtons(buttonsInfo) {
@@ -852,4 +845,9 @@ function showPopupMessage(message, type) {
             container.css('display', 'none');
         });
     }, 5000);
+}
+
+if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', updateModalDialogPosition);
+    window.visualViewport.addEventListener('scroll', updateModalDialogPosition);
 }

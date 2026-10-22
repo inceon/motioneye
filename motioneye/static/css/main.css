@@ -1459,3 +1459,329 @@ img.camera-progress {
         font-size: 14px !important;
     }
 }
+
+/* Keep the camera workspace visible and settings readable on handheld screens. */
+@media all and (max-width: 1000px) {
+    div.settings.open {
+        width: min(100%, 560px);
+        min-width: 0;
+        background-color: #282828;
+        overscroll-behavior: contain;
+        padding-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    div.settings-top-bar.open {
+        width: min(100%, 560px);
+        min-width: 0;
+    }
+}
+
+@media all and (max-width: 600px) {
+    div.page,
+    div.header-container {
+        min-width: 0;
+    }
+
+    div.header-container {
+        display: flex;
+        align-items: center;
+    }
+
+    div.settings-top-bar {
+        display: flex;
+        align-items: center;
+        flex: 1;
+        min-width: 0;
+    }
+
+    div.settings-top-bar.open,
+    div.settings.open {
+        width: 100%;
+    }
+
+    div.settings-top-bar > div.button.icon {
+        flex-shrink: 0;
+        box-sizing: border-box;
+    }
+
+    div.header.settings-open div.logo {
+        display: none;
+    }
+
+    div.logo {
+        flex-shrink: 0;
+    }
+
+    span.logo {
+        font-size: 22px;
+    }
+
+    #cameraSelect {
+        flex: 1;
+        min-width: 0;
+        max-width: none;
+        width: 0;
+        font-size: 16px;
+        height: 40px;
+    }
+
+    div.apply-button {
+        flex-shrink: 0;
+        width: auto;
+        min-width: 64px;
+        height: 40px;
+        line-height: 40px;
+        margin: 0 6px;
+        padding: 0 8px;
+        box-sizing: border-box;
+    }
+
+    div.settings-container {
+        white-space: normal;
+        padding-top: 0;
+    }
+
+    div.settings-section-title {
+        min-height: 44px;
+        box-sizing: border-box;
+        padding-top: 12px;
+        padding-bottom: 12px;
+    }
+
+    table.settings,
+    table.settings > tbody {
+        display: block;
+        width: 100%;
+        box-sizing: border-box;
+    }
+
+    table.settings {
+        padding: 8px 12px 16px;
+    }
+
+    tr.settings-item {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 32px;
+        gap: 4px;
+        padding: 8px 0;
+    }
+
+    td.settings-item-label {
+        width: auto;
+        text-align: left;
+        padding: 0;
+        align-self: center;
+        overflow-wrap: anywhere;
+    }
+
+    td.settings-item-value {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        width: auto;
+        min-width: 0;
+        padding: 0;
+    }
+
+    tr.settings-item > td:last-child:not(.settings-item-value):not(.settings-item-label) {
+        grid-column: 2;
+        grid-row: 1;
+        text-align: right;
+    }
+
+    div.settings span.help-mark {
+        visibility: visible;
+        width: 28px;
+        height: 28px;
+        line-height: 28px;
+    }
+
+    div.settings input.styled:not(.number):not(.working-schedule),
+    div.settings select.styled,
+    div.settings textarea.styled,
+    #diskUsageProgressBar {
+        width: calc(100% - 4px);
+    }
+
+    div.settings input.working-schedule {
+        max-width: 40%;
+    }
+
+    div.secret-field > input {
+        min-width: 0;
+    }
+
+    span.secret-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 40px;
+        min-height: 44px;
+        padding: 0;
+    }
+
+    div.camera-top-row {
+        flex-wrap: wrap;
+    }
+
+    div.camera-info {
+        flex-basis: 100%;
+        min-height: 28px;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 0 6px;
+    }
+
+    div.camera-name {
+        min-width: 0;
+    }
+
+    div.camera-fps {
+        flex-shrink: 0;
+    }
+
+    div.camera-top-buttons {
+        width: 100%;
+        text-align: right;
+    }
+
+    div.camera-top-button {
+        width: 44px;
+        height: 44px;
+    }
+
+    table.login-dialog,
+    table.add-camera-dialog,
+    table.edit-credentials-dialog,
+    table.login-dialog > tbody,
+    table.add-camera-dialog > tbody,
+    table.edit-credentials-dialog > tbody {
+        display: block;
+        width: 100%;
+        font-size: 16px;
+    }
+
+    table.login-dialog tr,
+    table.add-camera-dialog tr,
+    table.edit-credentials-dialog tr {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 28px;
+        gap: 4px;
+        padding: 6px 0;
+    }
+
+    td.dialog-item-label {
+        width: auto;
+        text-align: left;
+        padding: 0;
+        align-self: center;
+    }
+
+    td.dialog-item-value {
+        grid-column: 1 / -1;
+        grid-row: 2;
+        min-width: 0;
+        padding: 0;
+    }
+
+    td.dialog-item-label + td + td {
+        grid-column: 2;
+        grid-row: 1;
+    }
+
+    table.add-camera-dialog td:only-child,
+    table.edit-credentials-dialog td:only-child,
+    table.login-dialog td:only-child {
+        grid-column: 1 / -1;
+        grid-row: auto;
+    }
+
+    table.add-camera-dialog input.styled,
+    table.add-camera-dialog select.styled,
+    table.edit-credentials-dialog input.styled,
+    table.login-dialog input.styled {
+        width: calc(100% - 4px);
+    }
+
+    div.camera-action-button {
+        width: 44px;
+        height: 44px;
+    }
+
+    div.camera-action-buttons-wrapper {
+        max-height: 88px;
+    }
+
+    div.media-dialog-button,
+    div.media-dialog-group-button {
+        min-height: 44px;
+        line-height: 44px;
+    }
+
+    div.media-dialog-groups.small-screen {
+        white-space: nowrap;
+    }
+
+    div.media-list-entry {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 6px;
+        height: auto;
+        padding: 8px;
+    }
+
+    img.media-list-preview {
+        grid-column: 1;
+        grid-row: 1 / 3;
+        width: 96px;
+        max-width: 100%;
+        height: 54px;
+        object-fit: cover;
+        margin: 0;
+    }
+
+    div.media-list-entry-name,
+    div.media-list-entry-details {
+        grid-column: 2;
+        text-align: left;
+        padding: 0;
+    }
+
+    div.media-list-entry-name {
+        grid-row: 1;
+    }
+
+    div.media-list-entry-details {
+        grid-row: 2;
+    }
+
+    div.media-list-download-button,
+    div.media-list-delete-button {
+        grid-row: 3;
+        width: auto;
+        height: 44px;
+        line-height: 44px;
+        margin: 0;
+        padding: 0 8px;
+    }
+
+    div.media-list-download-button {
+        grid-column: 1;
+    }
+
+    div.media-list-delete-button {
+        grid-column: 2;
+    }
+
+    div.media-dialog-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+    }
+
+    div.media-dialog-button {
+        margin: 0;
+    }
+}

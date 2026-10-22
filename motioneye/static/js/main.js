@@ -1345,6 +1345,7 @@ function openSettings(cameraId) {
     }
 
     $('div.settings').addClass('open').removeClass('closed');
+    $('div.header').addClass('settings-open');
     var pageContainer = getPageContainer();
     pageContainer.addClass('stretched');
     $('div.settings-top-bar').addClass('open').removeClass('closed');
@@ -1367,6 +1368,7 @@ function closeSettings() {
     pushConfigs = {};
 
     $('div.settings').removeClass('open').addClass('closed');
+    $('div.header').removeClass('settings-open');
     var pageContainer = getPageContainer();
     pageContainer.removeClass('stretched');
     $('div.settings-top-bar').removeClass('open').addClass('closed');
@@ -3712,7 +3714,7 @@ function runAddCameraDialog() {
         content.find('tr.v4l2, tr.motioneye, tr.netcam, tr.mjpeg, tr.mmal').css('display', 'none');
 
         if (typeSelect.val() == 'motioneye') {
-            content.find('tr.motioneye').css('display', 'table-row');
+            content.find('tr.motioneye').css('display', '');
             addCameraInfo.html(
                 i18n.gettext("Fora motionEye kamerao estas kameraoj instalitaj malantaŭ alia servilo de MotionEye. Aldonante ilin ĉi tie permesos vin rigardi kaj administri ilin de malproksime."));
         }
@@ -3725,12 +3727,12 @@ function runAddCameraDialog() {
                 urlEntry.val(url + '/');
             }
 
-            content.find('tr.netcam').css('display', 'table-row');
+            content.find('tr.netcam').css('display', '');
             addCameraInfo.html(
                 i18n.gettext("Retaj kameraoj (aŭ IP-kameraoj) estas aparatoj, kiuj denaske fluas RTSP/RTMP aŭ MJPEG-filmetojn aŭ simplajn JPEG-bildojn. Konsultu la manlibron de via aparato por ekscii la ĝustan URL RTSP, RTMP, MJPEG aŭ JPEG."));
         }
         else if (typeSelect.val() == 'mmal') {
-            content.find('tr.mmal').css('display', 'table-row');
+            content.find('tr.mmal').css('display', '');
             addCameraInfo.html(
                 i18n.gettext("Lokaj MMAL-kameraoj estas aparatoj konektitaj rekte al via motionEye-sistemo. Ĉi tiuj estas kutime kart-specifaj kameraoj."));
         }
@@ -3743,12 +3745,12 @@ function runAddCameraDialog() {
                 urlEntry.val(url + '/');
             }
 
-            content.find('tr.mjpeg').css('display', 'table-row');
+            content.find('tr.mjpeg').css('display', '');
             addCameraInfo.html(
                 i18n.gettext("Aldonante vian aparaton kiel simplan MJPEG-kameraon anstataŭ kiel retan kameraon plibonigos la fotografaĵon, sed neniu moviĝo-detekto, bilda kaptado aŭ registrado de filmoj estos disponebla por ĝi. La kamerao devas esti alirebla por via servilo kaj via retumilo. Ĉi tiu tipo de kamerao ne kongruas kun Internet Explorer."));
         }
         else { /* assuming v4l2 */
-            content.find('tr.v4l2').css('display', 'table-row');
+            content.find('tr.v4l2').css('display', '');
             addCameraInfo.html(
                 i18n.gettext("Lokaj V4L2-kameraoj estas kameraaj aparatoj konektitaj rekte al via motionEye-sistemo, kutime per USB."));
         }
@@ -4442,7 +4444,7 @@ function runMediaDialog(cameraId, mediaType) {
 
         if (windowWidth < 1000) {
             mediaListDiv.width(windowWidth - 30);
-            mediaListDiv.height(windowHeight - 140);
+            mediaListDiv.height(Math.max(80, windowHeight - (windowWidth <= 600 ? 184 : 140)));
             groupsDiv.width(windowWidth - 30);
             groupsDiv.height('');
             groupsDiv.addClass('small-screen');
