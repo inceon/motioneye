@@ -7,7 +7,8 @@ var singleViewCameraId = null;
 var fullScreenMode = false;
 var wasInSingleModeBeforeFullScreen = false;
 var inProgress = false;
-var refreshInterval = 15; /* milliseconds */
+var refreshInterval = 15; /* minimum delay; raised while shutting down or restoring */
+var wakeCameraRefresh;
 var framerateFactor = 1;
 var resolutionFactor = 1;
 var basePath = null;
@@ -4703,7 +4704,6 @@ function addCameraFrameUi(cameraConfig) {
     }
 
     cameraFrameDiv.attr('id', 'camera' + cameraId);
-    cameraFrameDiv[0].refreshDivider = 0;
     cameraFrameDiv[0].config = cameraConfig;
     nameSpan.text(cameraConfig.name);
     progressImg.attr('src', staticPath + 'img/camera-progress.gif');
@@ -5105,6 +5105,8 @@ function recreateCameraFrames(cameras) {
         /* remove everything on the page */
         getPageContainer().children().remove();
 
+        cameraFramesCached = null;
+
         /* add camera frames */
         for (i = 0; i < cameras.length; i++) {
             camera = cameras[i];
@@ -5112,6 +5114,9 @@ function recreateCameraFrames(cameras) {
         }
 
         reorderCameraFrames();
+        if (wakeCameraRefresh) {
+            wakeCameraRefresh();
+        }
 
         $('#cameraOrderControlsSwitch').prop('checked', false).trigger('change');
         updateConfigUI();
@@ -5329,104 +5334,54 @@ function isSingleView() {
     return singleViewCameraId !== null;
 }
 
-function refreshCameraFrames() {
-    var timestamp = new Date().getTime();
-
+function refreshCameraFrames(timestamp) {
     if (modalContainer.css('display') != 'none') {
-        /* pause camera refresh if hidden by a dialog */
-        return setTimeout(refreshCameraFrames, 1000);
+        return 1000; /* pause snapshot requests while covered by a dialog */
+    }
+    if (refreshInterval > 1000) {
+        return 1000; /* server is shutting down, rebooting or restoring */
     }
 
-    function refreshCameraFrame(cameraId, img, serverSideResize) {
-        if (refreshDisabled[cameraId]) {
-            /* camera refreshing disabled, retry later */
-
-            return;
-        }
-
-        if (img.loading_count) {
-            img.loading_count++; /* increases each time the camera would refresh but is still loading */
-
-            if (img.loading_count > 2 * 1000 / refreshInterval) { /* limits the retries to one every two seconds */
-                img.loading_count = 0;
-            }
-            else {
-                return; /* wait for the previous frame to finish loading */
-            }
-        }
-
-        var path = basePath + 'picture/' + cameraId + '/current/?_=' + timestamp;
-        if (resolutionFactor != 1) {
-            path += '&width=' + resolutionFactor;
-        }
-        else if (serverSideResize) {
-            path += '&width=' + img.width;
-        }
-
-        img.src = path;
-        img.loading_count = 1;
-    }
-
-    var cameraFrames;
-    if (singleViewCameraId != null && singleViewCameraId >= 0) {
-        cameraFrames = getCameraFrame(singleViewCameraId);
-    }
-    else {
-        cameraFrames = getCameraFrames();
-    }
+    var cameraFrames = singleViewCameraId != null && singleViewCameraId >= 0 ?
+            getCameraFrame(singleViewCameraId) : getCameraFrames();
+    var nextRefresh = 1000;
 
     cameraFrames.each(function () {
         if (!this.img) {
             this.img = $(this).find('img.camera')[0];
             if (this.config['proto'] == 'mjpeg') {
                 var url = this.config['url'].replace('127.0.0.1', window.location.host.split(':')[0]);
-                url += (url.indexOf('?') > 0 ? '&' : '?') + '_=' + new Date().getTime();
-
-                /* if (url.indexOf('@') >= 0) {
-                    url = url.substring(0, url.indexOf('//') + 2)+ url.substring(url.indexOf('@') + 1);
-                } */
-
-                this.img.src = url;
+                this.img.src = url + (url.indexOf('?') > 0 ? '&' : '?') + '_=' + timestamp;
             }
         }
-
         if (this.config['proto'] == 'mjpeg') {
-            return; /* no manual refresh for simple mjpeg cameras */
+            return; /* native MJPEG streams manage their own frame delivery */
         }
 
-        var count = parseInt(1000 / (refreshInterval * this.config['streaming_framerate']));
-        var serverSideResize = this.config['streaming_server_resize'];
         var cameraId = this.id.substring(6);
-
-        count /= framerateFactor;
-
-        /* if frameFactor is 0, we only want one camera refresh at the beginning,
-         * and no subsequent refreshes at all */
-        if (framerateFactor == 0 && this.refreshDivider == 0) {
-            refreshCameraFrame(cameraId, this.img, serverSideResize);
-            this.refreshDivider++;
-        }
-
-        if (this.img.error) {
-            /* in case of error, decrease the refresh rate to 1 fps */
-            count = 1000 / refreshInterval;
-        }
-
-        if (this.refreshDivider < count) {
-            this.refreshDivider++;
-        }
-        else {
-            refreshCameraFrame(cameraId, this.img, serverSideResize);
-            this.refreshDivider = 0;
+        if (!refreshDisabled[cameraId]) {
+            var delay = refreshCameraImage(this.img, {
+                basePath: basePath,
+                cameraId: cameraId,
+                framerate: (Number(this.config['streaming_framerate']) || 1) * framerateFactor,
+                width: resolutionFactor != 1 ? resolutionFactor :
+                        (this.config['streaming_server_resize'] ? this.img.width : null)
+            }, timestamp);
+            nextRefresh = Math.min(nextRefresh, delay);
         }
 
         cameraFrameRatios[cameraId] = this.img.naturalWidth > 0 ? this.img.naturalHeight / this.img.naturalWidth : 1;
     });
 
-    setTimeout(refreshCameraFrames, refreshInterval);
+    return Math.max(refreshInterval, nextRefresh);
 }
 
 function checkCameraErrors() {
+    if (document.hidden) {
+        setTimeout(checkCameraErrors, 1000);
+        return;
+    }
+
     /* properly triggers the onerror event on the cameras whose imgs were not successfully loaded,
      * but the onerror event hasn't been triggered, for some reason (seems to happen in Chrome) */
     var cameraImgs = getPageContainer().find('img.camera');
@@ -5539,11 +5494,21 @@ $(document).ready(function () {
         });
     }
 
-    refreshCameraFrames();
-    checkCameraErrors();
+    if (!frame) {
+        wakeCameraRefresh = startCameraRefreshLoop(refreshCameraFrames);
+        checkCameraErrors();
+    }
 
+    var layoutPending = false;
     $(window).on('resize', function () {
-        updateLayout();
+        if (layoutPending) {
+            return;
+        }
+        layoutPending = true;
+        requestAnimationFrame(function () {
+            layoutPending = false;
+            updateLayout();
+        });
     });
 
     document.addEventListener('fullscreenchange', function() {

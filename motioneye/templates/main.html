@@ -4,19 +4,20 @@
 
 {% block style %}
     {{super()}}
-    <link rel="stylesheet" type="text/css" href="{{static_path}}css/ui.css?v={{version}}">
-    <link rel="stylesheet" type="text/css" href="{{static_path}}css/main.css?v={{version}}">
+    <link rel="stylesheet" type="text/css" href="{{static_path}}css/ui.css?v={{static_version('css/ui.css')}}">
+    <link rel="stylesheet" type="text/css" href="{{static_path}}css/main.css?v={{static_version('css/main.css')}}">
     {% if frame %}
-        <link rel="stylesheet" type="text/css" href="{{static_path}}css/frame.css?v={{version}}">
+        <link rel="stylesheet" type="text/css" href="{{static_path}}css/frame.css?v={{static_version('css/frame.css')}}">
     {% endif %}
 {% endblock %}
 
 {% block script %}
     {{super()}}
-    <script defer src="{{static_path}}js/ui.js?v={{version}}"></script>
+    <script defer src="{{static_path}}js/camera.js?v={{static_version('js/camera.js')}}"></script>
+    <script defer src="{{static_path}}js/ui.js?v={{static_version('js/ui.js')}}"></script>
     <script defer src="{{static_path}}js/main.js?v={{static_version('js/main.js')}}"></script>
     {% if frame %}
-        <script defer src="{{static_path}}js/frame.js?v={{version}}"></script>
+        <script defer src="{{static_path}}js/frame.js?v={{static_version('js/frame.js')}}"></script>
     {% endif %}
 {% endblock %}
 
