@@ -21,6 +21,7 @@ import logging
 import multiprocessing
 import os.path
 import re
+import struct
 import subprocess
 from collections.abc import Awaitable
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ from errno import EAGAIN, ENOENT
 from hashlib import sha1
 from io import BytesIO
 from signal import SIGKILL, SIGTERM
+from tempfile import mkstemp
 from time import time
 from typing import Any
 from zipfile import ZipFile
@@ -488,7 +490,7 @@ def get_movie_duration_seconds(path: str) -> int:
     ]
 
     try:
-        result = utils.call_subprocess(cmd, stderr=None)
+        result = utils.call_subprocess(cmd, stderr=None, timeout=10)
         duration_seconds = int(float(result))
         return duration_seconds
 
@@ -497,103 +499,138 @@ def get_movie_duration_seconds(path: str) -> int:
         return 0
 
 
-def make_movie_preview(camera_config: dict, rel_path: str) -> str | None:
-    target_dir: str = camera_config['target_dir']
-    utils.validate_paths(rel_path, target_dir=target_dir)
-    full_path = os.path.join(target_dir, rel_path)
+def _needs_faststart(path: str) -> bool | None:
+    """Inspect MP4 top-level atoms without reading the video payload."""
+    with open(path, 'rb') as movie:
+        size = os.fstat(movie.fileno()).st_size
+        saw_media = False
+        while movie.tell() + 8 <= size:
+            offset = movie.tell()
+            length, kind = struct.unpack('>I4s', movie.read(8))
+            header_size = 8
+            if length == 1:
+                extended = movie.read(8)
+                if len(extended) != 8:
+                    return None
+                length = struct.unpack('>Q', extended)[0]
+                header_size = 16
+            elif length == 0:
+                length = size - offset
+            if length < header_size or offset + length > size:
+                return None
+            if kind == b'moof':  # fragmented MP4 already supports streaming
+                return False
+            if kind == b'moov':
+                return saw_media
+            saw_media |= kind == b'mdat'
+            movie.seek(offset + length)
+    return None
 
-    framerate = camera_config['framerate']
-    pre_capture = camera_config['pre_capture']
-    offs = pre_capture / framerate
-    movie_duration = get_movie_duration_seconds(full_path)
-    offs = max(
-        (x for x in {offs * 2, offs} if x <= movie_duration), default=movie_duration / 2
-    )
-    thumb_path: str = full_path + '.thumb'
 
-    logging.debug(
-        f'creating movie preview for {full_path} with an offset of {offs} seconds...'
-    )
-
-    cmd: list = [
-        'ffmpeg',
-        '-i',
-        full_path,
-        '-f',
-        'mjpeg',
-        '-vframes',
-        '1',
-        '-ss',
-        str(offs),
-        '-y',
-        thumb_path,
-    ]
-    logging.debug(f'running command {cmd}')
-
+def optimize_movie(camera_config: dict, rel_path: str) -> bool:
+    """Move the index of a completed MP4 to the front without re-encoding."""
+    path = get_media_path(camera_config, rel_path)
+    if not path.lower().endswith('.mp4'):
+        return False
+    temporary = None
     try:
-        utils.call_subprocess(cmd, stderr=subprocess.STDOUT)
-
-    except subprocess.CalledProcessError as e:
-        logging.error(f'failed to create movie preview for {full_path}: {e}')
-
-        return None
-
-    try:
-        st = os.stat(thumb_path)
-
-    except OSError:
-        logging.error(f'failed to create movie preview for {full_path}')
-
-        return None
-
-    if st.st_size == 0:
-        logging.debug(
-            f'movie probably too short, grabbing first frame from {full_path}...'
+        before = os.stat(path)
+        if _needs_faststart(path) is not True:
+            return False
+        fd, temporary = mkstemp(
+            prefix='.faststart-', suffix='.mp4', dir=os.path.dirname(path)
         )
+        os.close(fd)
+        utils.call_subprocess(
+            [
+                'ffmpeg',
+                '-v',
+                'error',
+                '-nostdin',
+                '-y',
+                '-i',
+                path,
+                '-map',
+                '0',
+                '-c',
+                'copy',
+                '-movflags',
+                '+faststart',
+                temporary,
+            ],
+            timeout=60,
+        )
+        after = os.stat(path)
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) or _needs_faststart(temporary) is not False:
+            return False
+        replacement = os.stat(temporary)
+        if (replacement.st_uid, replacement.st_gid) != (before.st_uid, before.st_gid):
+            os.chown(temporary, before.st_uid, before.st_gid)
+        os.chmod(temporary, before.st_mode & 0o777)
+        os.utime(temporary, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(temporary, path)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        logging.exception('could not optimize movie %s', path)
+        return False
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
 
-        cmd = [
-            'ffmpeg',
-            '-i',
-            full_path,
-            '-f',
-            'mjpeg',
-            '-vframes',
-            '1',
-            '-ss',
-            '0',
-            '-y',
-            thumb_path,
-        ]
-        logging.debug(f'running command {cmd}')
 
-        # try again, this time grabbing the very first frame
-        try:
-            utils.call_subprocess(cmd, stderr=subprocess.STDOUT)
+def prepare_movie(camera_config: dict, rel_path: str) -> str | None:
+    # Runs in the background task pool after Motion closes the recording.
+    optimize_movie(camera_config, rel_path)
+    return make_movie_preview(camera_config, rel_path)
 
-        except subprocess.CalledProcessError as e:
-            logging.error(f'failed to create movie preview for {full_path}: {e}')
 
-            return None
+def make_movie_preview(camera_config: dict, rel_path: str) -> str | None:
+    full_path = get_media_path(camera_config, rel_path)
+    thumb_path = full_path + '.thumb'
+    if os.path.isfile(thumb_path) and os.path.getsize(thumb_path):
+        return thumb_path
 
-        try:
-            st = os.stat(thumb_path)
-
-        except OSError:
-            logging.error(f'failed to create movie preview for {full_path}')
-
-            return None
-
-    if st.st_size == 0:
-        logging.error(f'failed to create movie preview for {full_path}')
-        try:
-            os.remove(thumb_path)
-
-        except Exception:  # nosec: B110 # noqa: S110
-            pass  # nothing we can do about it
-
-        return None
-
-    return thumb_path
+    offs = camera_config['pre_capture'] / camera_config['framerate']
+    duration = get_movie_duration_seconds(full_path)
+    offs = max((x for x in {offs * 2, offs} if x <= duration), default=duration / 2)
+    temporary = None
+    try:
+        fd, temporary = mkstemp(
+            prefix='.preview-', suffix='.thumb', dir=os.path.dirname(full_path)
+        )
+        os.close(fd)
+        # Publish only complete thumbnails. Concurrent requests/background tasks
+        # can safely generate the same preview without reading partial JPEGs.
+        for offset in dict.fromkeys((offs, 0)):
+            cmd = [
+                'ffmpeg',
+                '-nostdin',
+                '-ss',
+                str(offset),
+                '-i',
+                full_path,
+                '-f',
+                'mjpeg',
+                '-vframes',
+                '1',
+                '-y',
+                temporary,
+            ]
+            logging.debug('creating movie preview: %s', cmd)
+            utils.call_subprocess(cmd, stderr=subprocess.STDOUT, timeout=15)
+            if os.path.getsize(temporary):
+                os.replace(temporary, thumb_path)
+                return thumb_path
+    except (OSError, subprocess.SubprocessError) as e:
+        logging.error('failed to create movie preview for %s: %s', full_path, e)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.remove(temporary)
+    return None
 
 
 def list_media(

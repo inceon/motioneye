@@ -365,6 +365,7 @@ class TestMediaFilesPathValidation(unittest.TestCase):
         # a valid relative path is joined back onto target_dir for ffmpeg
         rel_path = 'group/movie.mp4'
         expected_full = os.path.join(self._camera_config['target_dir'], rel_path)
+        os.makedirs(os.path.dirname(expected_full), exist_ok=True)
         captured = {}
 
         def fake_call_subprocess(cmd, **kwargs):

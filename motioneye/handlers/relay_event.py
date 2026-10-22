@@ -93,11 +93,11 @@ class RelayEventHandler(BaseHandler):
             motionctl.set_motion_detected(camera_id, False)
 
         elif event == 'movie_end':
-            # generate preview (thumbnail)
+            # Optimize the closed recording and generate its preview off-loop.
             tasks.add(
                 5,
-                mediafiles.make_movie_preview,
-                tag=f'make_movie_preview({filename})',
+                mediafiles.prepare_movie,
+                tag=f'prepare_movie({filename})',
                 camera_config=camera_config,
                 rel_path=filename,
             )

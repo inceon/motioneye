@@ -63,3 +63,38 @@ class RemoteMoviePlaybackTest(RemoteCameraTestCase):
 
         self.assertEqual(200, response.code)
         self.assertEqual('video/mpeg', response.headers['Content-Type'])
+
+    def test_range_requests_do_not_hash_or_refetch_the_recording(self):
+        first = self.fetch_playback('range.mp4', b'0123456789')
+        with (
+            patch.object(
+                MoviePlaybackHandler,
+                'get_content_version',
+                side_effect=AssertionError('hashed movie'),
+            ),
+            patch('motioneye.remote.get_media_content', AsyncMock()) as remote,
+        ):
+            response = self.fetch(
+                '/movie/1/playback/range.mp4',
+                headers={
+                    'Cookie': self.make_session_cookie('admin'),
+                    'Range': 'bytes=3-5',
+                },
+            )
+        self.assertEqual(206, response.code)
+        self.assertEqual(b'345', response.body)
+        self.assertEqual('bytes 3-5/10', response.headers['Content-Range'])
+        self.assertEqual(first.headers['Etag'], response.headers['Etag'])
+        remote.assert_not_awaited()
+
+    def test_head_returns_movie_metadata_without_a_body(self):
+        self.fetch_playback('head.mp4', b'0123456789')
+        response = self.fetch(
+            '/movie/1/playback/head.mp4',
+            method='HEAD',
+            headers={'Cookie': self.make_session_cookie('admin')},
+        )
+        self.assertEqual(200, response.code)
+        self.assertEqual('10', response.headers['Content-Length'])
+        self.assertEqual('bytes', response.headers['Accept-Ranges'])
+        self.assertEqual(b'', response.body)

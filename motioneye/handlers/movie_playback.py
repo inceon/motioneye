@@ -47,6 +47,9 @@ class MoviePlaybackHandler(StaticFileHandler, BaseHandler):
     if not os.path.exists(tmpdir):
         os.mkdir(tmpdir)
 
+    async def head(self, camera_id: str, filename: str):
+        await self.get(camera_id, filename, include_body=False)
+
     @BaseHandler.auth()
     @BaseHandler.peer_allowed()
     async def get(self, camera_id: str, filename: str, include_body=True):
@@ -142,6 +145,12 @@ class MoviePlaybackHandler(StaticFileHandler, BaseHandler):
             os.path.splitext(self.absolute_path)[1][1:].lower(),
             'application/octet-stream',
         )
+
+    def compute_etag(self):
+        # Hashing an entire recording synchronously delays even small Range
+        # requests. Stat metadata also changes when a recording is replaced.
+        stat = self._stat()
+        return f'"{stat.st_ino:x}-{stat.st_size:x}-{stat.st_mtime_ns:x}"'
 
 
 class MovieDownloadHandler(MoviePlaybackHandler):
