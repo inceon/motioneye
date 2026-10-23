@@ -86,7 +86,7 @@ def _perform(c, retry):
     _perform_once(c)
 
 
-def send_message(api_key, chat_id, message, files, retry=True):
+def send_message(api_key, chat_id, message, files, retry=True, movie=False):
     telegram_message_url = f'https://api.telegram.org/bot{api_key}/sendMessage'
     telegram_photo_url = f'https://api.telegram.org/bot{api_key}/sendPhoto'
     c = pycurl.Curl()
@@ -104,14 +104,27 @@ def send_message(api_key, chat_id, message, files, retry=True):
             logging.info('files present')
             failed = 0
             for f in files:
-                c.setopt(c.URL, telegram_photo_url)
-                # Send photos
+                field = 'photo'
+                url = telegram_photo_url
+                if movie:
+                    if os.path.getsize(f) > 50 * 1024 * 1024:
+                        raise RuntimeError(
+                            'video exceeds Telegram upload limit of 50 MB'
+                        )
+                    field = (
+                        'video'
+                        if os.path.splitext(f)[1].lower() == '.mp4'
+                        else 'document'
+                    )
+                    method = 'sendVideo' if field == 'video' else 'sendDocument'
+                    url = f'https://api.telegram.org/bot{api_key}/{method}'
+                c.setopt(c.URL, url)
                 c.setopt(
                     c.HTTPPOST,
                     [
                         ("chat_id", chat_id),
                         ("caption", message.encode()),
-                        ("photo", (c.FORM_FILE, os.fsencode(f))),
+                        (field, (c.FORM_FILE, os.fsencode(f))),
                     ],
                 )
                 try:
@@ -122,7 +135,8 @@ def send_message(api_key, chat_id, message, files, retry=True):
                     failed += 1
 
             if failed > 0:
-                raise RuntimeError(f'{failed} of {len(files)} pictures not sent')
+                kind = 'videos' if movie else 'pictures'
+                raise RuntimeError(f'{failed} of {len(files)} {kind} not sent')
 
     finally:
         c.close()
@@ -224,6 +238,7 @@ def parse_options(parser, args):
     parser.description = 'Send Telegram using bot api'
     parser.add_argument('motion_camera_id', help='the id of the motion camera')
     parser.add_argument('moment', help='the moment in ISO-8601 format')
+    parser.add_argument('--movie', help='the completed movie file to send')
     options, extra = parser.parse_known_args(args)
     if extra:  # without their values, they may be secrets
         parser.error(
@@ -260,6 +275,21 @@ def main(parser, args):
         return
 
     vars(options).update(stored)
+
+    if options.movie:
+        message = 'Video recorded by camera "%(camera)s/%(hostname)s" at %(moment)s (%(timezone)s).'
+
+        def on_movie_message(message, _files):
+            try:
+                send_message(
+                    options.api, options.chatid, message, [options.movie], movie=True
+                )
+                logging.info('telegram video sent')
+            except Exception:
+                logging.exception('failed to send telegram video')
+
+        make_message(message, camera_id, options.moment, 0, on_movie_message)
+        return
 
     # do not wait too long for media list,
     # telegram notifications are critical

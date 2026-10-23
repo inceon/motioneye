@@ -1625,3 +1625,11 @@ msgstr "second"
 #: motioneye/utils/dtconv.py:164
 msgid "minus"
 msgstr "minus"
+
+#: motioneye/templates/main.html
+msgid "Sendu Videojn"
+msgstr "Send Videos"
+
+#: motioneye/templates/main.html
+msgid "sendu ĉiun filmon post la fino de registrado; ebligu Filmojn; MP4 estas sendata kiel video, aliaj formatoj kiel dosieroj; maksimuma grandeco estas 50 MB"
+msgstr "Send each movie after recording finishes; enable Movies; MP4 is sent as video, other formats as files; maximum size is 50 MB"

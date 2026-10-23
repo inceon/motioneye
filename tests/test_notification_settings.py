@@ -205,6 +205,22 @@ class _ConfigCase(unittest.TestCase):
 
 
 class ConfigTest(_ConfigCase):
+    def test_video_notification_round_trip_and_disable(self):
+        data = self._save(**dict(_UI, telegram_notifications_send_video=True))
+        command = _find_command('sendtelegram') + config._SHORT + ' --movie "%f"'
+        self.assertIn(command, data['on_movie_end'])
+        self.assertNotIn(command, data['on_event_start'])
+        self._write(1, data)
+        ui = self._get()
+        self.assertTrue(ui['telegram_notifications_send_video'])
+        self.assertFalse(ui['command_storage_enabled'])
+        for field in (
+            'telegram_notifications_send_video',
+            'telegram_notifications_enabled',
+        ):
+            disabled = config.motion_camera_ui_to_dict(dict(ui, **{field: False}), data)
+            self.assertNotIn(command, disabled['on_movie_end'])
+
     def test_lines_hold_no_email_or_telegram_settings(self):
         expected = _new_lines()
         ui = config.motion_camera_dict_to_ui(self.camera)
@@ -412,6 +428,21 @@ class SenderTest(_ConfigCase):
         self.assertEqual(('123456:FAKE-token', '-1001234567'), sent)
         _, camera_id, moment, timespan, _ = self.make_telegram.call_args.args
         self.assertEqual((1, datetime(2026, 1, 1), 10), (camera_id, moment, timespan))
+
+    def test_telegram_sends_completed_movie_without_waiting_for_pictures(self):
+        sendtelegram.main(
+            meyectl.make_arg_parser('sendtelegram'),
+            ['1', _EVENT, '--movie', '/data/front door.mp4'],
+        )
+        self.assertEqual(0, self.make_telegram.call_args.args[-2])
+        self.make_telegram.call_args.args[-1]('video message', [])
+        self.send_telegram.assert_called_once_with(
+            '123456:FAKE-token',
+            '-1001234567',
+            'video message',
+            ['/data/front door.mp4'],
+            movie=True,
+        )
 
     def test_missing_settings_send_nothing(self):
         for camera_id in (None, 2):  # unknown motion camera, no settings

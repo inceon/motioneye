@@ -1516,6 +1516,13 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
     # movie end
     on_movie_end = [f"{meyectl.find_command('relayevent')} movie_end %t %f"]
 
+    if ui['telegram_notifications_enabled'] and ui.get(
+        'telegram_notifications_send_video', False
+    ):
+        on_movie_end.append(
+            meyectl.find_command('sendtelegram') + _SHORT + ' --movie "%f"'
+        )
+
     if ui['web_hook_storage_enabled']:
         url = sub(
             '\\s',
@@ -1969,6 +1976,7 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
 
     ui['email_notifications_picture_time_span'] = 0
     ui['telegram_notifications_picture_time_span'] = 0
+    ui['telegram_notifications_send_video'] = False
     command_notifications = []
     for e in on_event_start:
         if ' sendmail ' in e and e.endswith(_SHORT):
@@ -2033,7 +2041,10 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
 
     command_storage = []
     for e in on_movie_end:
-        if ' webhook ' in e and _parsable(e, 'on_movie_end', data['@id']):
+        if ' sendtelegram ' in e and e.endswith(_SHORT + ' --movie "%f"'):
+            ui['telegram_notifications_send_video'] = True
+
+        elif ' webhook ' in e and _parsable(e, 'on_movie_end', data['@id']):
             e = split(e)
 
             if len(e) < 3:

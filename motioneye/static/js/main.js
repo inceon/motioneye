@@ -1895,6 +1895,7 @@ function cameraUi2Dict() {
         'telegram_notifications_api': $('#telegramAPIEntry').val(),
         'telegram_notifications_chat_id': $('#telegramCIDEntry').val(),
         'telegram_notifications_picture_time_span': $('#telegramPictureTimeSpanEntry').val(),
+        'telegram_notifications_send_video': $('#telegramSendVideoSwitch')[0].checked,
         'web_hook_notifications_enabled': $('#webHookNotificationsEnabledSwitch')[0].checked,
         'web_hook_notifications_url': $('#webHookNotificationsUrlEntry').val(),
         'web_hook_notifications_http_method': $('#webHookNotificationsHttpMethodSelect').val(),
@@ -2252,6 +2253,7 @@ function dict2CameraUi(dict) {
     $('#telegramAPIEntry').val(dict['telegram_notifications_api']);
     $('#telegramCIDEntry').val(dict['telegram_notifications_chat_id']);
     $('#telegramPictureTimeSpanEntry').val(dict['telegram_notifications_picture_time_span']);
+    $('#telegramSendVideoSwitch')[0].checked = !!dict['telegram_notifications_send_video'];
 
     $('#webHookNotificationsEnabledSwitch')[0].checked = dict['web_hook_notifications_enabled']; markHideIfNull('web_hook_notifications_enabled', 'webHookNotificationsEnabledSwitch');
     $('#webHookNotificationsUrlEntry').val(dict['web_hook_notifications_url']);

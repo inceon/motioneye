@@ -121,6 +121,37 @@ def _too_many_requests(retry_after):
 
 
 class SendMessageTest(unittest.TestCase):
+    def test_sends_mp4_as_video_and_other_formats_as_documents(self):
+        for extension, method, field in (
+            ('mp4', 'sendVideo', 'video'),
+            ('mkv', 'sendDocument', 'document'),
+            ('avi', 'sendDocument', 'document'),
+        ):
+            with self.subTest(extension=extension):
+                curl = _FakeCurl([_OK])
+                path = f'/Küche/front door.{extension}'
+                with (
+                    patch('pycurl.Curl', return_value=curl),
+                    patch('os.path.getsize', return_value=1024),
+                ):
+                    sendtelegram.send_message(_TOKEN, '42', 'Video', [path], movie=True)
+                self.assertTrue(curl.options[pycurl.URL].endswith('/' + method))
+                self.assertIn(
+                    (field, (pycurl.FORM_FILE, os.fsencode(path))), curl.posts[0]
+                )
+                self.assertTrue(curl.closed)
+
+    def test_refuses_oversized_video_before_upload(self):
+        curl = _FakeCurl([])
+        with (
+            patch('pycurl.Curl', return_value=curl),
+            patch('os.path.getsize', return_value=50 * 1024 * 1024 + 1),
+            self.assertRaisesRegex(RuntimeError, '50 MB'),
+        ):
+            sendtelegram.send_message(_TOKEN, '42', 'Video', ['/large.mp4'], movie=True)
+        self.assertEqual([], curl.posts)
+        self.assertTrue(curl.closed)
+
     def _send(self, curl, message='message', files=(), chat_id=42, retry=True):
         self.sleeps = []
         with (
