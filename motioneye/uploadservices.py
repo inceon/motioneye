@@ -18,19 +18,23 @@ from __future__ import annotations
 import json
 import logging
 import os.path
+import ssl
+import warnings
 from abc import ABC, abstractmethod
 from base64 import b64decode, b64encode
 from datetime import datetime
 from ftplib import FTP as FTPc  # nosec: B402
-from hashlib import md5
+from ftplib import FTP_TLS as FTPTLSc  # nosec: B402
+from hashlib import md5, sha256
 from inspect import isabstract
 from io import BytesIO, StringIO
 from mimetypes import guess_type
 from os import stat
+from secrets import token_urlsafe
 from stat import S_IMODE
 from time import time
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request
 
 import boto3
@@ -40,6 +44,9 @@ from motioneye import settings, utils
 
 _STATE_FILE_NAME: str = 'uploadservices.json'
 _services: dict | None = None
+# PKCE code verifier per service, from creating its authorization link until its
+# key is redeemed, so that a code read from the redirect is of no use to others
+_code_verifiers: dict[str, str] = {}
 
 
 class UploadService(ABC):
@@ -140,6 +147,12 @@ class UploadService(ABC):
         pass
 
 
+def _authorization_code(key: str) -> str:
+    """Return the code from the address the browser was sent to, or the code."""
+    query = parse_qs(urlparse(key.strip()).query)
+    return query['code'][0] if 'code' in query else key.strip()
+
+
 class GoogleBase(UploadService, ABC):
     SCOPE: str
     AUTH_URL: str = 'https://accounts.google.com/o/oauth2/auth'
@@ -148,6 +161,9 @@ class GoogleBase(UploadService, ABC):
         '349038943026-m16svdadjrqc0c449u4qv71v1m1niu5o.apps.googleusercontent.com'
     )
     CLIENT_NOT_SO_SECRET: str = 'jjqbWmICpA0GvbhsJB3okX7s'
+    # Google blocked the out-of-band flow (urn:ietf:wg:oauth:2.0:oob). The browser
+    # cannot open this address, but the key is in the address it shows
+    REDIRECT_URI: str = 'http://127.0.0.1'
 
     def __init__(self, camera_id: str) -> None:
         self._location: str | None = None
@@ -159,12 +175,17 @@ class GoogleBase(UploadService, ABC):
 
     @classmethod
     def get_authorize_url(cls) -> str:
+        verifier = token_urlsafe(64)
+        _code_verifiers[cls.NAME] = verifier
+        challenge = b64encode(sha256(verifier.encode()).digest(), b'-_')
         query = {
             'scope': cls.SCOPE,
-            'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
+            'redirect_uri': cls.REDIRECT_URI,
             'response_type': 'code',
             'client_id': cls.CLIENT_ID,
             'access_type': 'offline',
+            'code_challenge': challenge.rstrip(b'=').decode(),
+            'code_challenge_method': 'S256',
         }
 
         return cls.AUTH_URL + '?' + urlencode(query)
@@ -268,11 +289,17 @@ class GoogleBase(UploadService, ABC):
         return response
 
     def _request_credentials(self, authorization_key):
+        verifier = _code_verifiers.get(self.NAME)
+        if not verifier:
+            # e.g. motionEye was restarted since the link was opened
+            raise RuntimeError('the key is from an older link, please obtain a new key')
+
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
 
         body = {
-            'code': authorization_key,
-            'redirect_uri': 'urn:ietf:wg:oauth:2.0:oob',
+            'code': _authorization_code(authorization_key),
+            'code_verifier': verifier,
+            'redirect_uri': self.REDIRECT_URI,
             'client_id': self.CLIENT_ID,
             'client_secret': self.CLIENT_NOT_SO_SECRET,
             'scope': self.SCOPE,
@@ -292,6 +319,7 @@ class GoogleBase(UploadService, ABC):
             )
 
         data = json.load(response)
+        del _code_verifiers[self.NAME]
 
         return {
             'access_token': data['access_token'],
@@ -842,6 +870,7 @@ class Webdav(UploadService):
         self._username: str | None = None
         self._password: str | None = None
         self._location: str | None = None
+        self._verify: bool = True
         super().__init__(camera_id)
 
     def _request(self, url, method, body=None):
@@ -851,11 +880,14 @@ class Webdav(UploadService):
         headers = {'Authorization': f'Basic {base64string}'}
         if body is not None:
             headers.update({'Content-Length': len(body)})
-        self.debug(f'request: {method} {url}')
+        self.debug(
+            f'request: {method} {url}'
+            f'{"" if self._verify else " (certificate check off)"}'
+        )
         request = Request(url, data=body, headers=headers)
         request.get_method = lambda: method
         try:
-            utils.urlopen(request)
+            utils.urlopen(request, verify=self._verify)
         except HTTPError as e:
             if method == 'MKCOL' and e.code == 405:
                 self.debug(
@@ -898,6 +930,7 @@ class Webdav(UploadService):
             'username': self._username,
             'password': self._password,
             'location': self._location,
+            'verify': self._verify,
         }
 
     def load(self, data: dict) -> None:
@@ -909,11 +942,30 @@ class Webdav(UploadService):
             self._password = data['password']
         if data.get('location'):
             self._location = data['location']
+        if data.get('verify') is not None:
+            self._verify = utils.verify_setting(data['verify'])
+
+
+class _FTPTLSSessionReuse(FTPTLSc):
+    """FTP_TLS that resumes the control connection's TLS session on the data
+    connections. vsftpd, ProFTPD and FileZilla Server require that by default
+    and refuse the transfer otherwise; ftplib does not do it (python/cpython#63699)."""
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = FTPc.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(
+                conn, server_hostname=self.host, session=self.sock.session
+            )
+
+        return conn, size
 
 
 class FTP(UploadService):
     NAME = 'ftp'
     CONN_LIFE_TIME = 60  # don't keep an FTP connection for more than 1 minute
+    # seconds; without a timeout a server that never answers hangs the "Test" button
+    SOCKET_TIMEOUT = 30
 
     def __init__(self, camera_id: str) -> None:
         self._server: str | None = None
@@ -921,6 +973,8 @@ class FTP(UploadService):
         self._username: str | None = None
         self._password: str | None = None
         self._location: str | None = None
+        self._tls: bool = False
+        self._verify: bool = True
         self._conn = None
         self._conn_time: float | None = 0
         super().__init__(camera_id)
@@ -948,12 +1002,17 @@ class FTP(UploadService):
         path = os.path.dirname(filename)
         filename = os.path.basename(filename)
 
-        conn = self._get_conn()
-        path = self._make_dirs(self._location + '/' + path, conn=conn)
-        conn.cwd(path)
+        try:
+            conn = self._get_conn()
+            path = self._make_dirs(self._location + '/' + path, conn=conn)
+            conn.cwd(path)
 
-        self.debug(f'uploading {filename} of {len(data)} bytes')
-        conn.storbinary(f'STOR {filename}', BytesIO(data))
+            self.debug(f'uploading {filename} of {len(data)} bytes')
+            conn.storbinary(f'STOR {filename}', BytesIO(data))
+        except Exception:
+            # the connection may be out of step with the server now: do not reuse it
+            self._drop_conn()
+            raise
 
         self.debug('upload done')
 
@@ -964,6 +1023,8 @@ class FTP(UploadService):
             'username': self._username,
             'password': self._password,
             'location': self._location,
+            'tls': self._tls,
+            'verify': self._verify,
         }
 
     def load(self, data: dict) -> None:
@@ -977,22 +1038,53 @@ class FTP(UploadService):
             self._password = data['password']
         if data.get('location'):
             self._location = data['location']
+        if data.get('tls') is not None:
+            self._tls = bool(data['tls'])
+        if data.get('verify') is not None:
+            self._verify = utils.verify_setting(data['verify'])
+        # the settings may have changed: the next upload must connect afresh
+        self._drop_conn()
 
     def _get_conn(self, create=False):
         now = time()
         if self._conn is None or now - self._conn_time > self.CONN_LIFE_TIME or create:
             self.debug(
-                'creating connection to {}@{}:{}'.format(
-                    self._username or 'anonymous', self._server, self._port
+                'creating {} connection to {}@{}:{}'.format(
+                    f'TLS (certificate check {"on" if self._verify else "off"})'
+                    if self._tls
+                    else 'plain',
+                    self._username or 'anonymous',
+                    self._server,
+                    self._port,
                 )
             )
-            self._conn = FTPc()  # nosec: B321
-            self._conn.set_pasv(True)
-            self._conn.connect(self._server, port=self._port)
-            self._conn.login(self._username or 'anonymous', self._password)
+            self._drop_conn()
+            if self._tls:
+                context = ssl.create_default_context()
+                if not self._verify:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                conn = _FTPTLSSessionReuse(context=context, timeout=self.SOCKET_TIMEOUT)
+            else:
+                conn = FTPc(timeout=self.SOCKET_TIMEOUT)  # nosec: B321
+            conn.set_pasv(True)
+            conn.connect(self._server, port=self._port)
+            conn.login(self._username or 'anonymous', self._password)
+            if self._tls:
+                conn.prot_p()
+            # cached only once it is fully set up
+            self._conn = conn
             self._conn_time = now
 
         return self._conn
+
+    def _drop_conn(self) -> None:
+        conn, self._conn, self._conn_time = self._conn, None, 0
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _make_dirs(self, path, conn=None):
         conn = conn or self._get_conn()
@@ -1049,8 +1141,8 @@ class SFTP(UploadService):
 
         # list of commands to send after upload.
         rm_operations = [
-            f'RM {self._location}/{test_file}',
-            f'RMDIR {self._location}/{test_folder}',
+            f'rm {self._location}/{test_file}',
+            f'rmdir {self._location}/{test_folder}',
         ]
 
         conn = self._get_conn(test_file)
@@ -1138,6 +1230,7 @@ class S3(UploadService):
         self._secret_key: str | None = None
         self._bucket: str | None = None
         self._sse_c_key: str | None = None
+        self._verify: bool = True
         super().__init__(camera_id)
 
     def dump(self) -> dict:
@@ -1147,11 +1240,13 @@ class S3(UploadService):
             'secret_key': self._secret_key,
             'bucket': self._bucket,
             'sse_c_key': self._sse_c_key,
+            'verify': self._verify,
         }
 
     def load(self, data: dict) -> None:
-        if data.get('endpoint_url'):
-            self._endpoint_url = data['endpoint_url']
+        if 'endpoint_url' in data:
+            # an empty field means AWS itself
+            self._endpoint_url = data['endpoint_url'] or None
         if data.get('access_key') is not None:
             self._access_key = data['access_key']
         if data.get('secret_key') is not None:
@@ -1160,17 +1255,28 @@ class S3(UploadService):
             self._bucket = data['bucket']
         if data.get('sse_c_key') is not None:
             self._sse_c_key = data['sse_c_key']
+        if data.get('verify') is not None:
+            self._verify = utils.verify_setting(data['verify'])
 
-    def upload_file(
-        self, target_dir: str | None, filename: str, camera_name: str
-    ) -> None:
-        # Create an S3 client
-        s3 = boto3.client(
+    def _client(self):
+        # the switch applies to a custom endpoint only; AWS itself is always
+        # verified; None is boto3's default
+        verify = False if self._endpoint_url is not None and not self._verify else None
+        if verify is False:
+            # urllib3 would warn on every single request; the user chose that
+            warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+        return boto3.client(
             's3',
             endpoint_url=self._endpoint_url,
             aws_access_key_id=self._access_key,
             aws_secret_access_key=self._secret_key,
+            verify=verify,
         )
+
+    def upload_file(
+        self, target_dir: str | None, filename: str, camera_name: str
+    ) -> None:
+        s3 = self._client()
 
         if target_dir:
             target_dir = os.path.realpath(target_dir)
@@ -1182,7 +1288,7 @@ class S3(UploadService):
 
         if self._sse_c_key:
             sse_key_md5 = b64encode(
-                md5(b64decode(self._sse_c_key)).digest()  # nosec: B324
+                md5(b64decode(self._sse_c_key), usedforsecurity=False).digest()
             ).decode()
             extra_args = {
                 'SSECustomerAlgorithm': 'AES256',
@@ -1201,13 +1307,7 @@ class S3(UploadService):
 
     def test_access(self):
         try:
-            # Create an S3 client
-            s3 = boto3.client(
-                's3',
-                endpoint_url=self._endpoint_url,
-                aws_access_key_id=self._access_key,
-                aws_secret_access_key=self._secret_key,
-            )
+            s3 = self._client()
             response = s3.list_buckets()
             logging.debug('Existing buckets:')
             for bucket in response['Buckets']:
@@ -1275,7 +1375,16 @@ def test_access(camera_id: int, service_name: str, data: dict) -> bool | str:
 
     service: UploadService = cls(camera_id=str(camera_id))
     service.load(data)
-    return service.test_access()
+    result = service.test_access()
+    if result is True:
+        # the key is spent, so the credentials obtained with it go to the service in
+        # use and the state file, as with Apply; the other settings of the test
+        # stay unapplied until Apply
+        credentials: dict | None = service.dump().get('credentials')
+        if credentials:
+            update(camera_id, service_name, {'credentials': credentials})
+
+    return result
 
 
 def update(camera_id: int, service_name: str, settings: dict) -> None:

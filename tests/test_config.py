@@ -76,18 +76,13 @@ class TestBackup(unittest.TestCase):
         data = config.backup()
         self._assert_tarball_members(data, ['mask_1.pgm', 'mask_2.pgm'])
 
-    def test_backup_includes_prefs_json(self):
-        self._create_files('prefs.json')
-
-        data = config.backup()
-        self._assert_tarball_members(data, ['prefs.json'])
-
     def test_backup_excludes_other_files(self):
         self._create_files(
             'motion.conf',
             'uploadservices.json',
             'secrets.json',
             'motioneye.conf',
+            'prefs.json',  # left by older versions, the preferences are in the browser now
         )
 
         data = config.backup()
@@ -161,18 +156,13 @@ class TestRestore(unittest.TestCase):
         config.restore(tarball)
         self._assert_restored_files('mask_1.pgm', 'mask_2.pgm')
 
-    def test_restore_extracts_prefs_json(self):
-        tarball = self._make_tarball('prefs.json')
-
-        config.restore(tarball)
-        self._assert_restored_files('prefs.json')
-
     def test_restore_ignores_non_matching_files(self):
         tarball = self._make_tarball(
             'motion.conf',
             'uploadservices.json',
             'secrets.json',
             'motioneye.conf',
+            'prefs.json',  # in backups of older versions
         )
 
         config.restore(tarball)
@@ -281,3 +271,18 @@ class TestNetcamParams(unittest.TestCase):
             },
             data,
         )
+
+
+class TestDefaultMotion(unittest.TestCase):
+    def test_control_interface_cannot_change_parameters_by_default(self):
+        data = {}
+        config._set_default_motion(data)
+
+        self.assertEqual(0, data['webcontrol_parms'])
+
+    def test_keeps_stored_control_interface_parameters(self):
+        # existing installations keep what is stored in motion.conf
+        data = {'webcontrol_parms': 2}
+        config._set_default_motion(data)
+
+        self.assertEqual(2, data['webcontrol_parms'])

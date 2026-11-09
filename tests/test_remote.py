@@ -18,11 +18,15 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+import ssl
 import unittest
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import AsyncMock, patch
+
+from tornado.httputil import HTTPHeaders
 
 from motioneye import remote
 
@@ -289,6 +293,190 @@ class TestRemoteErrorAnswers(unittest.IsolatedAsyncioTestCase):
             response = await remote._send_request(None)
 
         self.assertIsNone(response.error)
+
+
+class TestRemoteVerifyCertificate(unittest.IsolatedAsyncioTestCase):
+    """Requests to a remote motionEye verify its certificate unless the camera says not to."""
+
+    _LOCAL_CONFIG: ClassVar[dict[str, str | int]] = {
+        '@proto': 'motioneye',
+        '@scheme': 'https',
+        '@host': 'hub.example',
+        '@port': 8765,
+        '@remote_secret': 'secret',
+        '@remote_camera_id': 2,
+    }
+
+    # every function that talks to the remote, with the arguments it needs
+    _CALLS: ClassVar[dict[str, tuple]] = {
+        'list_cameras': (),
+        'get_config': (),
+        'set_config': ({'name': 'cam'},),
+        'test': ({'what': 'email'},),
+        'get_current_picture': (None, None),
+        'list_media': ('picture',),
+        'get_media_content': ('a.jpg', 'picture'),
+        'make_zipped_content': ('picture', 'group'),
+        'get_zipped_content': ('picture', 'key123', 'group'),
+        'make_timelapse_movie': (2, 1, 'group'),
+        'check_timelapse_movie': ('group',),
+        'get_timelapse_movie': ('key123', 'group'),
+        'get_media_preview': ('a.jpg', 'picture'),
+        'del_media_content': ('a.jpg', 'picture'),
+        'del_media_group': ('group', 'picture'),
+        'exec_action': ('snapshot',),
+        'get_authorize_url': ('gdrive',),
+    }
+
+    @staticmethod
+    def _answer():
+        # an answer each of the functions can take
+        return SimpleNamespace(
+            error=None,
+            code=200,
+            body=b'{"cameras": [], "key": "k"}',
+            headers=HTTPHeaders({'Content-Type': 'application/json'}),
+        )
+
+    async def _assert_every_request_verifies(self, local_config, expected):
+        send = AsyncMock(return_value=self._answer())
+        fetch = AsyncMock(return_value=self._answer())
+        with (
+            patch.object(remote, '_send_request', send),
+            patch.object(
+                remote, 'AsyncHTTPClient', return_value=SimpleNamespace(fetch=fetch)
+            ),
+        ):
+            for name, args in self._CALLS.items():
+                with self.subTest(function=name):
+                    send.reset_mock()
+                    fetch.reset_mock()
+                    await getattr(remote, name)(local_config, *args)
+
+                    request = (send.call_args or fetch.call_args).args[0]
+                    self.assertIs(expected, request.validate_cert)
+
+    def test_every_function_of_the_module_is_covered(self):
+        functions = {
+            name
+            for name, value in vars(remote).items()
+            if inspect.iscoroutinefunction(value) and not name.startswith('_')
+        }
+
+        self.assertEqual(functions, set(self._CALLS))
+
+    async def test_the_certificate_is_verified_by_default(self):
+        await self._assert_every_request_verifies(self._LOCAL_CONFIG, True)
+
+    async def test_the_certificate_is_verified_when_the_camera_says_so(self):
+        local_config = dict(self._LOCAL_CONFIG, **{'@remote_verify': True})
+
+        await self._assert_every_request_verifies(local_config, True)
+
+    async def test_the_certificate_check_can_be_turned_off_per_camera(self):
+        local_config = dict(self._LOCAL_CONFIG, **{'@remote_verify': False})
+
+        await self._assert_every_request_verifies(local_config, False)
+
+    async def test_the_add_camera_dialog_can_turn_the_check_off(self):
+        # camera discovery sends the dialog's fields without the '@', as booleans
+        # from the JSON body or as strings from the deprecated query string
+        for value, expected in ((False, False), ('false', False), ('true', True)):
+            with self.subTest(remote_verify=value):
+                details = {
+                    'scheme': 'https',
+                    'host': 'hub.example',
+                    'port': 8765,
+                    'remote_verify': value,
+                }
+                send = AsyncMock(return_value=self._answer())
+                with patch.object(remote, '_send_request', send):
+                    await remote.list_cameras(details)
+
+                self.assertIs(expected, send.call_args.args[0].validate_cert)
+
+    def test_the_flag_is_read_the_way_the_dialogs_send_it(self):
+        for value, expected in (
+            (None, True),
+            (True, True),
+            (False, False),
+            ('true', True),
+            ('on', True),
+            ('1', True),
+            ('false', False),
+            ('off', False),
+            ('0', False),
+            ('no', False),
+            ('', True),
+            ('maybe', True),
+            (' False ', False),
+        ):
+            with self.subTest(remote_verify=value):
+                self.assertIs(expected, remote._verify_flag({'remote_verify': value}))
+
+        self.assertIs(True, remote._verify_flag({}))
+        stored = {'@remote_verify': False, 'remote_verify': True}
+        self.assertIs(False, remote._verify_flag(stored))
+
+    async def test_a_certificate_failure_is_shown_verbatim(self):
+        failure = ssl.SSLCertVerificationError(
+            1,
+            '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: '
+            'self-signed certificate',
+        )
+        client = SimpleNamespace(fetch=AsyncMock(side_effect=failure))
+        failing_client = patch.object(remote, 'AsyncHTTPClient', return_value=client)
+        with failing_client, self.assertLogs(level='ERROR'):
+            resp = await remote.get_config(self._LOCAL_CONFIG)
+
+        self.assertIsNone(resp.remote_ui_config)
+        self.assertIn('CERTIFICATE_VERIFY_FAILED', resp.error)
+        self.assertIn('self-signed certificate', resp.error)
+
+
+class TestRemoteAuthorizeUrl(unittest.IsolatedAsyncioTestCase):
+    """The remote redeems the upload service key, with the PKCE verifier it kept
+    when creating the link, so the link has to come from the remote (#2516)."""
+
+    _LOCAL_CONFIG: ClassVar[dict[str, str | int]] = {
+        '@host': '192.168.1.20',
+        '@port': 8765,
+        '@path': '',
+        '@remote_camera_id': 3,
+    }
+
+    def _answer(self, code, body):
+        headers = HTTPHeaders({'Content-Type': 'application/json'})
+        answer = SimpleNamespace(code=code, headers=headers, body=body, error=None)
+        fetch = AsyncMock(return_value=answer)
+        return fetch, patch.object(
+            remote, 'AsyncHTTPClient', return_value=SimpleNamespace(fetch=fetch)
+        )
+
+    async def test_returns_the_link_the_remote_sends(self):
+        fetch, client = self._answer(200, b'{"url": "https://accounts.google.com/x"}')
+        with client:
+            url = await remote.get_authorize_url(self._LOCAL_CONFIG, 'gdrive')
+
+        self.assertEqual('https://accounts.google.com/x', url)
+        request = fetch.call_args[0][0]
+        self.assertEqual(
+            'http://192.168.1.20:8765/config/3/authorize/?service=gdrive', request.url
+        )
+        self.assertFalse(request.follow_redirects)
+
+    async def test_no_url_without_one_in_the_answer(self):
+        for code, body in (
+            (400, b'{"error": "no authorization url for upload service gdrive"}'),
+            (200, b'{}'),
+            (302, b''),  # a 0.45.0b1 remote redirects instead
+        ):
+            with self.subTest(code=code):
+                _fetch, client = self._answer(code, body)
+                with client, self.assertLogs(level='ERROR'):
+                    url = await remote.get_authorize_url(self._LOCAL_CONFIG, 'gdrive')
+
+                self.assertIsNone(url)
 
 
 if __name__ == '__main__':

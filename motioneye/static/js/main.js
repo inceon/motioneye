@@ -23,15 +23,15 @@ var initialConfigFetched = false; /* used to workaround browser extensions that 
 var pageContainer = null;
 var overlayVisible = false;
 var layoutColumns = 1;
+var chosenLayoutColumns = null; /* null: from the window width */
 var fitFramesVertically = false;
 var cameraOrder = []; /* camera IDs in layout order */
-// Was removed 5 years ago, needs cleanup, a25dec205b70fbf0f75f8c2f424d4920a875f399
-// var layoutRows = 1;
+var layoutRows = 1;
 var modalContainer = null;
 var cameraFramesCached = null;
 var cameraFramesTime = 0;
+var cameraFrameRatios = {};
 var qualifyURLElement;
-var cameraFrameRatios = [];
 var forcePasswordChange = false; /* flag to track if user needs to set password */
 
 /* page data and translations, see main.html */
@@ -405,11 +405,59 @@ function doLogout() {
     });
 }
 
+function openAuthorizeTab(url) {
+    /* the tab is opened right away, as browsers allow it only during the click,
+     * and the link is asked for apart: the server refuses to create one when a
+     * link from another site is followed */
+    var tab = window.open('', '_blank');
+    if (!tab) {
+        /* asking for a link anyway would replace the pending one for nothing */
+        showErrorMessage(i18n.gettext("The browser did not open a new tab. Allow pop-ups for this page and try again."));
+        return;
+    }
+
+    tab.opener = null;
+    ajax('GET', url, null, function (data) {
+        if (data && data.url) {
+            tab.location = data.url;
+        }
+        else {
+            tab.close();
+        }
+    });
+}
+
 function authorizeUpload() {
     var service = $('#uploadServiceSelect').val();
     var cameraId = $('#cameraSelect').val();
     var url = basePath + 'config/' + cameraId + '/authorize/?service=' + service;
-    window.open(url, '_blank');
+    if (service != 'gdrive' && service != 'gphoto') {
+        openAuthorizeTab(url);
+        return;
+    }
+
+    /* Google sends the browser to a loopback address that does not load, with the key in it */
+    var steps = $('<ol class="authorize-steps"></ol>');
+    [
+        i18n.gettext("Sign in to Google in the new tab, and allow access."),
+        i18n.gettext("The tab then shows a page that cannot be loaded, at an address starting with http://127.0.0.1/. This is expected."),
+        i18n.gettext("Copy the whole address from the address bar of that tab, and paste it as the authorization key."),
+    ].forEach(function (step) {
+        steps.append($('<li></li>').text(step));
+    });
+
+    var content = $('<div></div>').append(steps).append(
+        $('<p></p>').text(i18n.gettext("Testing the upload with the new key replaces the current Google authorization, even before the settings are applied."))
+    );
+
+    runModalDialog({
+        title: i18n.gettext("Obtaining the key from Google"),
+        content: content,
+        buttons: 'okcancel',
+        onOk: function () {
+            openAuthorizeTab(url);
+        }
+    });
 }
 
 
@@ -663,10 +711,13 @@ function initUI() {
         });
     });
 
+    /* the certificate rows also follow these, which their depends cannot express */
+    $('#uploadTlsSwitch, #uploadEndpointUrlEntry, #webHookNotificationsUrlEntry, #webHookEndNotificationsUrlEntry, #webHookStorageUrlEntry').on('change', updateConfigUI);
+
     /* prefs change handlers */
     $('#layoutColumnsSlider').on('change', function () {
-        var columns = parseInt(this.value);
-        setLayoutColumns(columns);
+        chosenLayoutColumns = parseInt(this.value);
+        setLayoutColumns(chosenLayoutColumns);
         savePrefs();
     });
     $('#fitFramesVerticallySwitch').on('change', function () {
@@ -785,7 +836,8 @@ function initUI() {
             dict2CameraUi(null);
             runEditCredentialsDialog($(this).val(), {
                 proto: 'motioneye',
-                url: selectedOption.attr('data-connection-url') || ''
+                url: selectedOption.attr('data-connection-url') || '',
+                remote_verify: selectedOption.attr('data-connection-verify') != 'false'
             });
         }
         else {
@@ -875,7 +927,11 @@ function initUI() {
             url = url.replace(/config\/\d+$/, '');
         }
 
-        runEditCredentialsDialog(cameraId, {proto: proto, url: url});
+        runEditCredentialsDialog(cameraId, {
+            proto: proto,
+            url: url,
+            remote_verify: $('#remoteVerifySwitch')[0].checked
+        });
     });
 
     /* logout button */
@@ -900,7 +956,8 @@ function initUI() {
         }
 
         var maskClass = event.target.id.substring(0, event.target.id.indexOf('MaskEditButton'));
-        enableMaskEdit(cameraId, maskClass, img._naturalWidth, img._naturalHeight);
+        var size = getMaskSize(maskClass, img);
+        enableMaskEdit(cameraId, maskClass, size[0], size[1]);
     });
     $('div#motionMaskSaveButton, div#privacyMaskSaveButton').on('click', function () {
         disableMaskEdit();
@@ -1008,65 +1065,101 @@ function setLayoutColumns(columns) {
     updateLayout();
 }
 
+/* until the layout columns are chosen in a browser, they follow the window width */
+function updateLayoutColumns() {
+    /* about 500px for each frame */
+    let columns = chosenLayoutColumns || Math.min(4, Math.max(1, Math.floor($(window).width() / 500)));
+
+    $('#layoutColumnsSlider').val(columns).each(function () {
+        this.update();
+    });
+    setLayoutColumns(columns);
+}
+
+/* the height/width ratio of a camera image: that of the last loaded picture,
+ * also kept while loading or in error, or 4:3 if none has been loaded yet */
+function getCameraImageRatio(img) {
+    if (img._naturalWidth && img._naturalHeight) {
+        return img._naturalHeight / img._naturalWidth;
+    }
+
+    return 0.75;
+}
+
 function updateLayout() {
+    /* in single view, the other frames are hidden only after this */
+    let frames = isSingleView() ? getCameraFrame(singleViewCameraId) : getCameraFrames();
+    if (!frames.length) {
+        return; /* no camera frames */
+    }
+
     if (fitFramesVertically) {
-        /* make sure the height of each camera
-         * is smaller than the height of the screen
-         * divided by the number of layout rows */
+        /* make sure the layout rows of camera frames
+         * fit into the height of the screen */
 
-        /* find the max height/width ratio */
-        var frames = getCameraFrames();
-        var maxRatio = 0;
+        let windowWidth = $(window).width();
+        let columns = layoutColumns;
+        if (isSingleView() || fullScreenMode) {
+            columns = 1; /* always 1 column when in full screen */
+        }
 
-        frames.each(function () {
-            var cameraId = this.id.substring(6);
-            var ratio = cameraFrameRatios[cameraId];
-            if (ratio > maxRatio) {
-                maxRatio = ratio;
-            }
+        let rows = layoutRows;
+        if (isSingleView() || fullScreenMode) {
+            rows = 1; /* a single camera fills the screen */
+        }
+
+        /* the frames of a row have the same width, so the row is as high as its
+         * highest height/width ratio; only the rows that fit into the screen count */
+        let rowRatios = [];
+        frames.slice(0, rows * columns).each(function (index) {
+            let img = $(this).find('img.camera')[0];
+            let ratio = getCameraImageRatio(img);
+
+            let row = Math.floor(index / columns);
+            rowRatios[row] = Math.max(rowRatios[row] || 0, ratio);
         });
 
-        if (!maxRatio) {
-            return; /* no camera frames */
-        }
+        /* the average ratio of the rows */
+        let ratio = rowRatios.reduce(function (sum, rowRatio) {
+            return sum + rowRatio;
+        }, 0) / rowRatios.length;
 
-        var pageContainer = getPageContainer();
-        var windowWidth = $(window).width();
+        /* the border and padding of a frame around its image, the same for all frames,
+         * whatever the aspect ratio of their image, but in em, hence measured */
+        let frame = frames.first();
+        let image = frame.find('img.camera');
+        let paddingHeight = (frame.outerHeight(true) - image.height()) || 0;
+        let paddingWidth = (frame.outerWidth(true) - image.width()) || 0;
 
-        var columns = layoutColumns;
-        if (isSingleView() || fullScreenMode || windowWidth <= 1200) {
-            columns = 1; /* always 1 column when in full screen or mobile */
-        }
-
-        var heightOffset = 5; /* some padding */
+        /* the available window height */
+        let heightOffset = 5; /* some padding */
         if (!fullScreenMode && !isSingleView()) {
             heightOffset += 50; /* top bar */
         }
+        let windowHeight = $(window).height() - heightOffset;
 
-        var windowHeight = $(window).height() - heightOffset;
-        var maxWidth = windowWidth;
-
-        var width = windowHeight / maxRatio * columns;
-        if (pageContainer.hasClass('stretched') && windowWidth > 1200) {
-            maxWidth *= 0.6; /* opened settings panel occupies 40% of the window width */
-        }
-
+        /* the container width so that rows fit */
+        let width = ((windowHeight / rows - paddingHeight) / ratio + paddingWidth) * columns;
         if (width < 100) {
             width = 100; /* absolute minimum width for a frame */
         }
 
+        /* other upper container width constraints */
+        let maxWidth = windowWidth;
+        let pageContainer = getPageContainer();
+        if (pageContainer.hasClass('stretched') && windowWidth > 1200) {
+            maxWidth *= 0.6; /* opened settings panel occupies 40% of the window width */
+        }
         if (width > maxWidth) {
-            getPageContainer().css('width', ''); /* page container width already at its maximum */
+            width = ''; /* page container width already at its maximum */
         }
-        else {
-            getPageContainer().css('width', width);
-        }
+
+        pageContainer.css('width', width);
     }
     else {
         getPageContainer().css('width', '');
     }
 
-    var frames = getCameraFrames();
     frames.each(function () {
         this.config.updateActionButtons();
     });
@@ -1074,6 +1167,10 @@ function updateLayout() {
 
 function showCameraOverlay() {
     getCameraFrames().find('div.camera-overlay').css('display', '');
+    /* the action buttons could not be measured while the overlay was hidden */
+    getCameraFrames().each(function () {
+        this.config.updateActionButtons();
+    });
     setTimeout(function () {
         getCameraFrames().find('div.camera-overlay').addClass('visible');
         updateCameraTopButtonState();
@@ -1091,6 +1188,27 @@ function hideCameraOverlay() {
     overlayVisible = false;
 
     disableMaskEdit();
+}
+
+function getMaskSize(maskClass, img) {
+    /* the mask grid depends on the size, so use the one the server parses and builds
+     * the mask with, not that of the preview, which the resolution dimmer scales down */
+    var maskLines = $('#'+maskClass+'MaskLinesEntry').val().split(',').map(function (v) {return parseInt(v);});
+    if (maskLines[0] > 0 && maskLines[1] > 0) {
+        return [maskLines[0], maskLines[1]]; /* the size of the current mask lines */
+    }
+
+    var resolution = $('#resolutionSelect').val();
+    if (resolution == 'custom') {
+        resolution = $('#customWidthEntry').val() + 'x' + $('#customHeightEntry').val();
+    }
+    var size = $('#resolutionSelect option').length && resolution ? resolution.split('x').map(function (v) {return parseInt(v);}) : [];
+    if (size[0] > 0 && size[1] > 0) {
+        var rotation = parseInt($('#rotationSelect').val());
+        return rotation == 90 || rotation == 270 ? [size[1], size[0]] : size;
+    }
+
+    return [img._naturalWidth, img._naturalHeight]; /* the capture size is not known */
 }
 
 function enableMaskEdit(cameraId, maskClass, width, height) {
@@ -1532,6 +1650,19 @@ function updateConfigUI() {
         }
     });
 
+    /* the certificate check needs TLS: FTP with the TLS switch, S3, WebDAV and the web hooks with an https URL */
+    var isHttps = function (url) { return /^https:\/\//i.test(url); };
+    var uploadService = $('#uploadServiceSelect').val();
+    var uploadTls = uploadService == 'ftp' ? $('#uploadTlsSwitch')[0].checked : isHttps($('#uploadEndpointUrlEntry').val());
+    if (!uploadTls) {
+        $('#uploadVerifySwitch').closest('tr.settings-item').each(markHideLogic);
+    }
+    [['webHookNotifications', 'webHookNotifications'], ['webHookEndNotifications', 'webHookEndNotifications'], ['webHookStorage', 'webHookStorage']].forEach(function (pair) {
+        if (!isHttps($('#' + pair[0] + 'UrlEntry').val())) {
+            $('#' + pair[1] + 'VerifySwitch').closest('tr.settings-item').each(markHideLogic);
+        }
+    });
+
     /* hide sections that have no visible configs and no switch */
     $('div.settings-section-title').each(function () {
         var $this = $(this);
@@ -1662,30 +1793,32 @@ function configUiValid() {
 
 function prefsUi2Dict() {
     var dict = {
-        'layout_columns': parseInt($('#layoutColumnsSlider').val()),
         'fit_frames_vertically': $('#fitFramesVerticallySwitch')[0].checked,
         'layout_rows': parseInt($('#layoutRowsSlider').val()),
         'framerate_factor': $('#framerateDimmerSlider').val() / 100,
         'resolution_factor': $('#resolutionDimmerSlider').val() / 100,
         'camera_order': cameraOrder
     };
+    if (chosenLayoutColumns) {
+        dict['layout_columns'] = chosenLayoutColumns;
+    }
 
     return dict;
 }
 
 function dict2PrefsUi(dict) {
-    $('#layoutColumnsSlider').val(dict['layout_columns']);
     $('#fitFramesVerticallySwitch')[0].checked = dict['fit_frames_vertically'];
     $('#layoutRowsSlider').val(dict['layout_rows']);
     $('#framerateDimmerSlider').val(dict['framerate_factor'] * 100);
     $('#resolutionDimmerSlider').val(dict['resolution_factor'] * 100);
     cameraOrder = dict['camera_order'] || [];
+    chosenLayoutColumns = dict['layout_columns'] >= 1 && dict['layout_columns'] <= 4 ? dict['layout_columns'] : null;
 
     updateConfigUI();
 }
 
 function applyPrefs(dict) {
-    setLayoutColumns(dict['layout_columns']);
+    updateLayoutColumns();
     fitFramesVertically = dict['fit_frames_vertically'];
     layoutRows = dict['layout_rows'];
     framerateFactor = dict['framerate_factor'];
@@ -1699,9 +1832,51 @@ function applyPrefs(dict) {
     }
 }
 
+/* the preferences are kept in each browser, as a phone and a desktop want different ones */
+/* one key per preference, e.g. motioneye.layout_rows, holding its value as JSON */
+var PREFS_KEY_PREFIX = 'motioneye.';
+var DEFAULT_PREFS = {
+    'layout_columns': null, /* from the window width */
+    'fit_frames_vertically': false,
+    'layout_rows': 1,
+    'framerate_factor': 1,
+    'resolution_factor': 1,
+    'camera_order': []
+};
+
+function loadPrefs() {
+    var prefs = {};
+    Object.keys(DEFAULT_PREFS).forEach(function (name) {
+        prefs[name] = DEFAULT_PREFS[name];
+        try {
+            var value = localStorage.getItem(PREFS_KEY_PREFIX + name);
+            if (value != null) {
+                prefs[name] = JSON.parse(value);
+            }
+        }
+        catch (e) {
+            /* no local storage, e.g. blocked by the browser, or not readable */
+        }
+    });
+
+    return prefs;
+}
+
 function savePrefs() {
-    var prefs = prefsUi2Dict();
-    ajax('POST', basePath + 'prefs/', prefs);
+    var prefs = Object.assign({'layout_columns': null}, prefsUi2Dict());
+    Object.keys(DEFAULT_PREFS).forEach(function (name) {
+        try {
+            if (prefs[name] == null) {
+                localStorage.removeItem(PREFS_KEY_PREFIX + name);
+            }
+            else {
+                localStorage.setItem(PREFS_KEY_PREFIX + name, JSON.stringify(prefs[name]));
+            }
+        }
+        catch (e) {
+            /* no local storage, the preferences last until the page is reloaded */
+        }
+    });
 }
 
 function mainUi2Dict() {
@@ -1749,6 +1924,12 @@ function dict2MainUi(dict) {
     updateConfigUI();
 }
 
+function smtpTlsSetting() {
+    /* STARTTLS stays true, as older versions read it */
+    var value = $('#smtpTlsSelect').val();
+    return value == 'tls' ? 'implicit' : value == 'starttls';
+}
+
 function cameraUi2Dict() {
     if ($('#videoDeviceEnabledSwitch')[0].error) { /* config error */
         return {
@@ -1761,6 +1942,7 @@ function cameraUi2Dict() {
         'name': $('#deviceNameEntry').val(),
         'admin_only': $('#adminOnlySwitch')[0].checked,
         'proto': $('#deviceTypeEntry')[0].proto,
+        'remote_verify': $('#remoteVerifySwitch')[0].checked,
 
         /* video device */
         'auto_brightness': $('#autoBrightnessSwitch')[0].checked,
@@ -1809,6 +1991,8 @@ function cameraUi2Dict() {
         'upload_subfolders': $('#uploadSubfoldersSwitch')[0].checked,
         'upload_username': $('#uploadUsernameEntry').val(),
         'upload_password': $('#uploadPasswordEntry').val(),
+        'upload_tls': $('#uploadTlsSwitch')[0].checked,
+        'upload_verify': $('#uploadVerifySwitch')[0].checked,
         'upload_authorization_key': $('#uploadAuthorizationKeyEntry').val(),
         'upload_endpoint_url': $('#uploadEndpointUrlEntry').val(),
         'upload_access_key': $('#uploadAccessKeyEntry').val(),
@@ -1820,6 +2004,7 @@ function cameraUi2Dict() {
         'web_hook_storage_enabled': $('#webHookStorageEnabledSwitch')[0].checked,
         'web_hook_storage_url': $('#webHookStorageUrlEntry').val(),
         'web_hook_storage_http_method': $('#webHookStorageHttpMethodSelect').val(),
+        'web_hook_storage_verify': $('#webHookStorageVerifySwitch')[0].checked,
         'command_storage_enabled': $('#commandStorageEnabledSwitch')[0].checked,
         'command_storage_exec': $('#commandStorageEntry').val(),
 
@@ -1880,6 +2065,8 @@ function cameraUi2Dict() {
         'motion_mask_lines': $('#motionMaskLinesEntry').val() ? $('#motionMaskLinesEntry').val().split(',').map(function (l) {return parseInt(l);}) : [],
         'show_frame_changes': $('#showFrameChangesSwitch')[0].checked,
         'create_debug_media': $('#createDebugMediaSwitch')[0].checked,
+        'motion_event_button': $('#motionEventButtonSwitch')[0].checked,
+        'motion_detection_button': $('#motionDetectionButtonSwitch')[0].checked,
 
         /* motion notifications */
         'email_notifications_enabled': $('#emailNotificationsEnabledSwitch')[0].checked,
@@ -1889,7 +2076,8 @@ function cameraUi2Dict() {
         'email_notifications_smtp_port': $('#smtpPortEntry').val(),
         'email_notifications_smtp_account': $('#smtpAccountEntry').val(),
         'email_notifications_smtp_password': $('#smtpPasswordEntry').val(),
-        'email_notifications_smtp_tls': $('#smtpTlsSwitch')[0].checked,
+        'email_notifications_smtp_tls': smtpTlsSetting(),
+        'email_notifications_smtp_verify': $('#smtpVerifySwitch')[0].checked,
         'email_notifications_picture_time_span': $('#emailPictureTimeSpanEntry').val(),
         'telegram_notifications_enabled': $('#telegramNotificationsEnabledSwitch')[0].checked,
         'telegram_notifications_api': $('#telegramAPIEntry').val(),
@@ -1899,9 +2087,11 @@ function cameraUi2Dict() {
         'web_hook_notifications_enabled': $('#webHookNotificationsEnabledSwitch')[0].checked,
         'web_hook_notifications_url': $('#webHookNotificationsUrlEntry').val(),
         'web_hook_notifications_http_method': $('#webHookNotificationsHttpMethodSelect').val(),
+        'web_hook_notifications_verify': $('#webHookNotificationsVerifySwitch')[0].checked,
         'web_hook_end_notifications_enabled': $('#webHookEndNotificationsEnabledSwitch')[0].checked,
         'web_hook_end_notifications_url': $('#webHookEndNotificationsUrlEntry').val(),
         'web_hook_end_notifications_http_method': $('#webHookEndNotificationsHttpMethodSelect').val(),
+        'web_hook_end_notifications_verify': $('#webHookEndNotificationsVerifySwitch')[0].checked,
         'command_notifications_enabled': $('#commandNotificationsEnabledSwitch')[0].checked,
         'command_notifications_exec': $('#commandNotificationsEntry').val(),
         'command_end_notifications_enabled': $('#commandEndNotificationsEnabledSwitch')[0].checked,
@@ -2031,6 +2221,7 @@ function dict2CameraUi(dict) {
     $('#deviceTypeEntry').val(prettyType); markHideIfNull(!prettyType, 'deviceTypeEntry');
     $('#deviceTypeEntry')[0].proto = dict['proto'];
     markHideIfNull(!['netcam', 'mjpeg', 'motioneye'].includes(dict['proto']), 'editCredentialsButton');
+    $('#remoteVerifySwitch')[0].checked = dict['remote_verify'] !== false; markHideIfNull(dict['remote_verify'] == null || dict['scheme'] != 'https', 'remoteVerifySwitch');
     $('#adminOnlySwitch')[0].checked = dict['admin_only']; markHideIfNull('admin_only', 'adminOnlySwitch');
     $('#autoBrightnessSwitch')[0].checked = dict['auto_brightness']; markHideIfNull('auto_brightness', 'autoBrightnessSwitch');
 
@@ -2125,6 +2316,8 @@ function dict2CameraUi(dict) {
     $('#uploadSubfoldersSwitch')[0].checked = dict['upload_subfolders']; markHideIfNull('upload_subfolders', 'uploadSubfoldersSwitch');
     $('#uploadUsernameEntry').val(dict['upload_username']); markHideIfNull('upload_username', 'uploadUsernameEntry');
     $('#uploadPasswordEntry').val(dict['upload_password']); markHideIfNull('upload_password', 'uploadPasswordEntry');
+    $('#uploadTlsSwitch')[0].checked = dict['upload_tls']; markHideIfNull('upload_tls', 'uploadTlsSwitch');
+    $('#uploadVerifySwitch')[0].checked = dict['upload_verify']; markHideIfNull('upload_verify', 'uploadVerifySwitch');
     $('#uploadAuthorizationKeyEntry').val(dict['upload_authorization_key']); markHideIfNull('upload_authorization_key', 'uploadAuthorizationKeyEntry');
     $('#uploadEndpointUrlEntry').val(dict['upload_endpoint_url']); markHideIfNull('upload_endpoint_url', 'uploadEndpointUrlEntry');
     $('#uploadAccessKeyEntry').val(dict['upload_access_key']); markHideIfNull('upload_access_key', 'uploadAccessKeyEntry');
@@ -2137,6 +2330,7 @@ function dict2CameraUi(dict) {
     $('#webHookStorageEnabledSwitch')[0].checked = dict['web_hook_storage_enabled']; markHideIfNull('web_hook_storage_enabled', 'webHookStorageEnabledSwitch');
     $('#webHookStorageUrlEntry').val(dict['web_hook_storage_url']);
     $('#webHookStorageHttpMethodSelect').val(dict['web_hook_storage_http_method']);
+    $('#webHookStorageVerifySwitch')[0].checked = dict['web_hook_storage_verify'] !== false; markHideIfNull('web_hook_storage_verify', 'webHookStorageVerifySwitch');
 
     $('#commandStorageEnabledSwitch')[0].checked = dict['command_storage_enabled']; markHideIfNull('command_storage_enabled', 'commandStorageEnabledSwitch');
     $('#commandStorageEntry').val(dict['command_storage_exec']);
@@ -2237,6 +2431,8 @@ function dict2CameraUi(dict) {
     $('#motionMaskLinesEntry').val((dict['motion_mask_lines'] || []).join(',')); markHideIfNull('motion_mask_lines', 'motionMaskLinesEntry');
     $('#showFrameChangesSwitch')[0].checked = dict['show_frame_changes']; markHideIfNull('show_frame_changes', 'showFrameChangesSwitch');
     $('#createDebugMediaSwitch')[0].checked = dict['create_debug_media']; markHideIfNull('create_debug_media', 'createDebugMediaSwitch');
+    $('#motionEventButtonSwitch')[0].checked = dict['motion_event_button']; markHideIfNull('motion_event_button', 'motionEventButtonSwitch');
+    $('#motionDetectionButtonSwitch')[0].checked = dict['motion_detection_button']; markHideIfNull('motion_detection_button', 'motionDetectionButtonSwitch');
 
     /* motion notifications */
     $('#emailNotificationsEnabledSwitch')[0].checked = dict['email_notifications_enabled']; markHideIfNull('email_notifications_enabled', 'emailNotificationsEnabledSwitch');
@@ -2246,7 +2442,9 @@ function dict2CameraUi(dict) {
     $('#smtpPortEntry').val(dict['email_notifications_smtp_port']);
     $('#smtpAccountEntry').val(dict['email_notifications_smtp_account']);
     $('#smtpPasswordEntry').val(dict['email_notifications_smtp_password']);
-    $('#smtpTlsSwitch')[0].checked = dict['email_notifications_smtp_tls'];
+    var smtpTls = dict['email_notifications_smtp_tls'];
+    $('#smtpTlsSelect').val(smtpTls == 'implicit' ? 'tls' : smtpTls ? 'starttls' : 'none');
+    $('#smtpVerifySwitch')[0].checked = dict['email_notifications_smtp_verify'] !== false;
     $('#emailPictureTimeSpanEntry').val(dict['email_notifications_picture_time_span']);
 
     $('#telegramNotificationsEnabledSwitch')[0].checked = dict['telegram_notifications_enabled']; markHideIfNull('telegram_notifications_enabled', 'telegramNotificationsEnabledSwitch');
@@ -2258,10 +2456,12 @@ function dict2CameraUi(dict) {
     $('#webHookNotificationsEnabledSwitch')[0].checked = dict['web_hook_notifications_enabled']; markHideIfNull('web_hook_notifications_enabled', 'webHookNotificationsEnabledSwitch');
     $('#webHookNotificationsUrlEntry').val(dict['web_hook_notifications_url']);
     $('#webHookNotificationsHttpMethodSelect').val(dict['web_hook_notifications_http_method']);
+    $('#webHookNotificationsVerifySwitch')[0].checked = dict['web_hook_notifications_verify'] !== false; markHideIfNull('web_hook_notifications_verify', 'webHookNotificationsVerifySwitch');
 
     $('#webHookEndNotificationsEnabledSwitch')[0].checked = dict['web_hook_end_notifications_enabled']; markHideIfNull('web_hook_end_notifications_enabled', 'webHookEndNotificationsEnabledSwitch');
     $('#webHookEndNotificationsUrlEntry').val(dict['web_hook_end_notifications_url']);
     $('#webHookEndNotificationsHttpMethodSelect').val(dict['web_hook_end_notifications_http_method']);
+    $('#webHookEndNotificationsVerifySwitch')[0].checked = dict['web_hook_end_notifications_verify'] !== false; markHideIfNull('web_hook_end_notifications_verify', 'webHookEndNotificationsVerifySwitch');
 
     $('#commandNotificationsEnabledSwitch')[0].checked = dict['command_notifications_enabled']; markHideIfNull('command_notifications_enabled', 'commandNotificationsEnabledSwitch');
     $('#commandNotificationsEntry').val(dict['command_notifications_exec']);
@@ -2747,6 +2947,8 @@ function doTestUpload() {
         subfolders: $('#uploadSubfoldersSwitch')[0].checked,
         username: $('#uploadUsernameEntry').val(),
         password: $('#uploadPasswordEntry').val(),
+        tls: $('#uploadTlsSwitch')[0].checked,
+        verify: $('#uploadVerifySwitch')[0].checked,
         authorization_key: $('#uploadAuthorizationKeyEntry').val(),
         endpoint_url: $('#uploadEndpointUrlEntry').val(),
         access_key: $('#uploadAccessKeyEntry').val(),
@@ -2772,7 +2974,7 @@ function doTestUpload() {
             showErrorMessage(i18n.gettext("Aliri la alŝutan servon malsukcesis: ") + data.error + '!');
         }
         else {
-            showPopupMessage(i18n.gettext("Aliri la alŝutan servon sukcesis!")+data, 'info');
+            showPopupMessage(i18n.gettext("Aliri la alŝutan servon sukcesis!"), 'info');
         }
     });
 }
@@ -2801,7 +3003,8 @@ function doTestEmail() {
         smtp_port: $('#smtpPortEntry').val(),
         smtp_account: $('#smtpAccountEntry').val(),
         smtp_password: $('#smtpPasswordEntry').val(),
-        smtp_tls: $('#smtpTlsSwitch')[0].checked
+        smtp_tls: smtpTlsSetting(),
+        smtp_verify: $('#smtpVerifySwitch')[0].checked
     };
 
     var cameraId = $('#cameraSelect').val();
@@ -2973,7 +3176,7 @@ function doDeleteAllFiles(mediaType, cameraId, groupKey, callback) {
 }
 
 function doAction(cameraId, action, callback) {
-    ajax('POST', basePath + 'action/' + cameraId + '/' + action + '/', null, function (data) {
+    ajax('POST', basePath + 'action/' + cameraId + '/' + action, null, function (data) {
         if (data == null || data.error) {
             showErrorMessage(data && data.error);
         }
@@ -3035,6 +3238,7 @@ function fetchCurrentConfig(onFetch) {
                         option.attr('data-connection-failed', 'true');
                         option.attr('data-connection-error', camera['connection_error'] || '');
                         option.attr('data-connection-url', camera['connection_url'] || '');
+                        option.attr('data-connection-verify', String(camera['remote_verify'] !== false));
                     }
                     cameraSelect.append(option);
                 }
@@ -3099,32 +3303,25 @@ function fetchCurrentConfig(onFetch) {
         pageContainer.append('<img class="main-loading-progress" src="' + staticPath + 'img/main-loading-progress.gif">');
     }
 
-    /* fetch the prefs */
-    ajax('GET', basePath + 'prefs/', null, function (data) {
-        if (data == null || data.error) {
-            showErrorMessage(data && data.error);
-            return;
-        }
+    var prefs = loadPrefs();
+    dict2PrefsUi(prefs);
+    applyPrefs(prefs);
 
-        dict2PrefsUi(data);
-        applyPrefs(data);
+    if (isAdmin()) {
+        /* fetch the main configuration */
+        ajax('GET', basePath + 'config/main/get/', null, function (data) {
+            if (data == null || data.error) {
+                showErrorMessage(data && data.error);
+                return;
+            }
 
-        if (isAdmin()) {
-            /* fetch the main configuration */
-            ajax('GET', basePath + 'config/main/get/', null, function (data) {
-                if (data == null || data.error) {
-                    showErrorMessage(data && data.error);
-                    return;
-                }
-
-                dict2MainUi(data);
-                fetchCameraList();
-            });
-        }
-        else {
+            dict2MainUi(data);
             fetchCameraList();
-        }
-    });
+        });
+    }
+    else {
+        fetchCameraList();
+    }
 }
 
 function fetchCurrentCameraConfig(onFetch) {
@@ -3137,7 +3334,8 @@ function fetchCurrentCameraConfig(onFetch) {
                 if (data && data.connection_failed && isAdmin()) {
                     runEditCredentialsDialog(cameraId, {
                         proto: 'motioneye',
-                        url: data.connection_url || ''
+                        url: data.connection_url || '',
+                        remote_verify: data.remote_verify !== false
                     });
                 }
                 if (onFetch) {
@@ -3298,11 +3496,20 @@ function runLoginDialog(retry) {
                         +i18n.gettext("Pasvorto") + '</span></td>' +
                     '<td class="dialog-item-value"><input type="password" name="password" class="styled" id="passwordEntry"></td>' +
                 '</tr>' +
+                '<tr>' +
+                    '<td class="dialog-item-label"><span class="dialog-item-label">'
+                        +i18n.gettext("Remember me") + '</span></td>' +
+                    '<td class="dialog-item-value"><input type="checkbox" name="remember" class="styled" id="rememberCheck" checked></td>' +
+                    '<td><span class="help-mark" title="'+i18n.gettext("keeps you logged in after the browser is closed: for 24 hours as the admin, for 30 days as the surveillance user")+'">?</span></td>' +
+                '</tr>' +
             '</table></form>');
 
     var usernameEntry = form.find('#usernameEntry');
     var passwordEntry = form.find('#passwordEntry');
+    var rememberCheck = form.find('#rememberCheck');
     var errorTd = form.find('td.login-dialog-error');
+
+    makeCheckBox(rememberCheck);
 
     // A failed session check should prompt login prompt.
     if (window._loginRetry) {
@@ -3324,7 +3531,9 @@ function runLoginDialog(retry) {
                     type: 'POST',
                     data: {
                         username: username,
-                        password: password
+                        password: password,
+                        /* otherwise the session cookie is dropped when the browser is closed */
+                        remember: rememberCheck[0].checked ? 1 : 0
                     },
                     success: function(data) {
                         if (data.error) {
@@ -3374,7 +3583,10 @@ function runLoginDialog(retry) {
                     error: function(xhr) {
                         var message = i18n.gettext('Login failed.');
 
-                        if (xhr.responseJSON && xhr.responseJSON.error) {
+                        if (xhr.status === 429 && xhr.responseJSON && xhr.responseJSON.retry_after) {
+                            message = i18n.gettext('Too many failed login attempts. Try again in %(seconds)s s.').format({seconds: xhr.responseJSON.retry_after});
+                        }
+                        else if (xhr.responseJSON && xhr.responseJSON.error) {
                             message = xhr.responseJSON.error;
                         }
 
@@ -3525,7 +3737,7 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
 
     /* the handlers are registered once per dialog and read entries[pos] at
      * click time, so they always act on the currently displayed file */
-    playButton.on('click', function() {
+    function playEntry() {
         var entry = entries[pos];
         if (video_container.get(0).canPlayType(entry.mimeType) == '') {
             return;  /* the timelapse chain may trigger this on a non-playable entry */
@@ -3545,10 +3757,16 @@ function runPictureDialog(entries, pos, mediaType, onDelete) {
         video_container.attr('preload', 'auto');
         video_container.attr('src', basePath + mediaType + '/' + entry.cameraId + '/playback' + entry.path);
         video_container.get(0).load();
+    }
+
+    playButton.on('click', function() {
+        /* a plain play ends any chain started by the timelapse button */
+        video_container.off('ended.pictureDialog');
+        playEntry();
     });
 
     timelapseButton.on('click', function() {
-        playButton.trigger('click');
+        playEntry();
         video_container.get(0).playbackRate = 5;
         video_container.off('ended.pictureDialog').on('ended.pictureDialog', function() {
             if (pos > 0) {
@@ -3681,6 +3899,11 @@ function runAddCameraDialog() {
                     '<td class="dialog-item-value"><input type="password" class="styled" id="remoteSecretDialogEntry" placeholder="'+i18n.gettext("remote secret...")+'"></td>' +
                     '<td><span class="help-mark" title="'+i18n.gettext("the client secret of the remote motionEye server. Find this value in the Client Secret field of the remote server\'s general settings.")+'">?</span></td>' +
                 '</tr>' +
+                '<tr class="motioneye remote-verify">' +
+                    '<td class="dialog-item-label"><span class="dialog-item-label">'+i18n.gettext("Verify certificate")+'</span></td>' +
+                    '<td class="dialog-item-value"><input type="checkbox" class="styled" id="remoteVerifyDialogSwitch"></td>' +
+                    '<td><span class="help-mark" title="'+i18n.gettext("check the remote motionEye\'s TLS certificate against the trusted authorities of this system; turn this off only for a remote with a self-signed certificate that you trust; the connection is then still encrypted, but the remote is not authenticated")+'">?</span></td>' +
+                '</tr>' +
                 '<tr class="v4l2 motioneye netcam mjpeg mmal">' +
                     '<td class="dialog-item-label"><span class="dialog-item-label">'+i18n.gettext("Kamerao")+'</span></td>' +
                     '<td class="dialog-item-value"><select class="styled" id="addCameraSelect"></select><span id="cameraMsgLabel"></span></td>' +
@@ -3703,6 +3926,7 @@ function runAddCameraDialog() {
     var addCameraInfo = content.find('#addCameraInfo');
     var cameraMsgLabel = content.find('#cameraMsgLabel');
     var remoteSecretDialogEntry = content.find('#remoteSecretDialogEntry');
+    var remoteVerifyDialogSwitch = content.find('#remoteVerifyDialogSwitch');
 
     var isProgress = false;
 
@@ -3711,12 +3935,18 @@ function runAddCameraDialog() {
     makeRequiredValidator(addCameraSelect);
     makeRequiredValidator(remoteSecretDialogEntry);
 
+    remoteVerifyDialogSwitch[0].checked = true;
+    makeCheckBox(remoteVerifyDialogSwitch);
+
     /* ui interaction */
     function updateUi() {
         content.find('tr.v4l2, tr.motioneye, tr.netcam, tr.mjpeg, tr.mmal').css('display', 'none');
 
         if (typeSelect.val() == 'motioneye') {
             content.find('tr.motioneye').css('display', '');
+            if (!/^https:\/\//i.test(urlEntry.val().trim())) {
+                content.find('tr.remote-verify').css('display', 'none');
+            }
             addCameraInfo.html(
                 i18n.gettext("Fora motionEye kamerao estas kameraoj instalitaj malantaŭ alia servilo de MotionEye. Aldonante ilin ĉi tie permesos vin rigardi kaj administri ilin de malproksime."));
         }
@@ -3850,6 +4080,7 @@ function runAddCameraDialog() {
 
         if (data.proto == 'motioneye') {
             data.remote_secret = remoteSecretDialogEntry.val();
+            data.remote_verify = remoteVerifyDialogSwitch[0].checked;
         } else {
             data.username = usernameEntry.val();
             data.password = passwordEntry.val();
@@ -3905,6 +4136,7 @@ function runAddCameraDialog() {
     usernameEntry.on('change', updateUi);
     passwordEntry.on('change', updateUi);
     remoteSecretDialogEntry.on('change', updateUi);
+    remoteVerifyDialogSwitch.on('change', updateUi);
 
     runModalDialog({
         title: i18n.gettext('Aldonadi kameraon...'),
@@ -3952,6 +4184,10 @@ function runAddCameraDialog() {
                 var value = option._extra_attrs[key];
                 data[key] = value;
             });
+
+            if (typeSelect.val() == 'motioneye') {
+                data.remote_verify = remoteVerifyDialogSwitch[0].checked;
+            }
 
             beginProgress();
             ajax('POST', basePath + 'config/add/', data, function (data) {
@@ -4004,6 +4240,11 @@ function runEditCredentialsDialog(cameraId, data) {
                 '<td class="dialog-item-label"><span class="dialog-item-label">'+i18n.gettext("Remote Secret")+'</span></td>' +
                 '<td class="dialog-item-value"><input type="password" class="styled" id="remoteSecretDialogEntry" placeholder="'+i18n.gettext("remote secret...")+'"></td>' +
                 '<td><span class="help-mark" title="'+i18n.gettext("leave empty to keep the current remote secret")+'">?</span></td>' +
+            '</tr>' +
+            '<tr class="remote-verify">' +
+                '<td class="dialog-item-label"><span class="dialog-item-label">'+i18n.gettext("Verify certificate")+'</span></td>' +
+                '<td class="dialog-item-value"><input type="checkbox" class="styled" id="remoteVerifyDialogSwitch"></td>' +
+                '<td><span class="help-mark" title="'+i18n.gettext("check the remote motionEye\'s TLS certificate against the trusted authorities of this system; turn this off only for a remote with a self-signed certificate that you trust; the connection is then still encrypted, but the remote is not authenticated")+'">?</span></td>' +
             '</tr>';
     }
 
@@ -4012,8 +4253,22 @@ function runEditCredentialsDialog(cameraId, data) {
     var usernameEntry = content.find('#usernameEntry');
     var passwordEntry = content.find('#passwordEntry');
     var remoteSecretDialogEntry = content.find('#remoteSecretDialogEntry');
+    var remoteVerifyDialogSwitch = content.find('#remoteVerifyDialogSwitch');
+
+    function updateVerifyRow() {
+        var secure = /^https:\/\//i.test(urlEntry.val().trim());
+        content.find('tr.remote-verify').css('display', secure ? 'table-row' : 'none');
+        updateModalDialogPosition();
+    }
 
     urlEntry.val(data.url || '');
+
+    if (data.proto == 'motioneye') {
+        remoteVerifyDialogSwitch[0].checked = data.remote_verify !== false;
+        makeCheckBox(remoteVerifyDialogSwitch);
+        urlEntry.on('change input', updateVerifyRow);
+        updateVerifyRow();
+    }
 
     makeUrlValidator(urlEntry);
 
@@ -4037,8 +4292,11 @@ function runEditCredentialsDialog(cameraId, data) {
                     payload.password = passwordEntry.val();
                 }
             }
-            else if (data.proto == 'motioneye' && remoteSecretDialogEntry.val()) {
-                payload.remote_secret = remoteSecretDialogEntry.val();
+            else if (data.proto == 'motioneye') {
+                if (remoteSecretDialogEntry.val()) {
+                    payload.remote_secret = remoteSecretDialogEntry.val();
+                }
+                payload.remote_verify = remoteVerifyDialogSwitch[0].checked;
             }
 
             beginProgress();
@@ -4632,7 +4890,8 @@ function addCameraFrameUi(cameraConfig) {
                             '<div class="button icon camera-action-button mouse-effect alarm-on" title="turn alarm on"></div>' +
                             '<div class="button icon camera-action-button mouse-effect alarm-off" title="turn alarm off"></div>' +
                             '<div class="button icon camera-action-button mouse-effect snapshot" title="' + i18n.gettext("preni instantaron") + '"></div>' +
-                            '<div class="button icon camera-action-button mouse-effect record-start" title="toggle continuous recording mode"></div>' +
+                            '<div class="button icon camera-action-button mouse-effect eventstart" title="' + i18n.gettext("start a motion event") + '"></div>' +
+                            '<div class="button icon camera-action-button mouse-effect detectionpause" title="' + i18n.gettext("pause motion detection") + '"></div>' +
                             '<div class="button icon camera-action-button mouse-effect up" title="up"></div>' +
                             '<div class="button icon camera-action-button mouse-effect down" title="down"></div>' +
                             '<div class="button icon camera-action-button mouse-effect left" title="left"></div>' +
@@ -4673,7 +4932,8 @@ function addCameraFrameUi(cameraConfig) {
     var alarmOnButton = cameraFrameDiv.find('div.camera-action-button.alarm-on');
     var alarmOffButton = cameraFrameDiv.find('div.camera-action-button.alarm-off');
     var snapshotButton = cameraFrameDiv.find('div.camera-action-button.snapshot');
-    var recordButton = cameraFrameDiv.find('div.camera-action-button.record-start');
+    var motionEventButton = cameraFrameDiv.find('div.camera-action-button.eventstart');
+    var motionDetectionButton = cameraFrameDiv.find('div.camera-action-button.detectionpause');
     var upButton = cameraFrameDiv.find('div.camera-action-button.up');
     var rightButton = cameraFrameDiv.find('div.camera-action-button.right');
     var downButton = cameraFrameDiv.find('div.camera-action-button.down');
@@ -4903,7 +5163,8 @@ function addCameraFrameUi(cameraConfig) {
         'alarm_on': alarmOnButton,
         'alarm_off': alarmOffButton,
         'snapshot': snapshotButton,
-        'record': recordButton,
+        'motion_event': motionEventButton,
+        'motion_detection': motionDetectionButton,
         'up': upButton,
         'right': rightButton,
         'down': downButton,
@@ -4935,16 +5196,18 @@ function addCameraFrameUi(cameraConfig) {
 
             button.addClass('pending');
 
-            if (action == 'record') {
-                if (button.hasClass('record-start')) {
-                    action = 'record_start';
-                }
-                else {
-                    action = 'record_stop';
-                }
+            let actionToDo;
+            if (action === 'motion_event') {
+                actionToDo = button.hasClass('eventstart') ? 'eventstart' : 'eventend';
+            }
+            else if (action === 'motion_detection') {
+                actionToDo = button.hasClass('detectionpause') ? 'detectionpause' : 'detectionstart';
+            }
+            else {
+                actionToDo = action;
             }
 
-            doAction(cameraId, action, function () {
+            doAction(cameraId, actionToDo, function () {
                 button.removeClass('pending');
             });
         })
@@ -4955,21 +5218,26 @@ function addCameraFrameUi(cameraConfig) {
 
     /* error and load handlers */
     cameraImg[0].onerror = function () {
+        var wasError = this.error;
         this.error = true;
         this.loading_count = 0;
 
         cameraImg.addClass('error').removeClass('initializing');
-        cameraImg.height(Math.round(cameraImg.width() * 0.75));
+        cameraImg.css('aspect-ratio', '1 / ' + getCameraImageRatio(this)); /* no picture to give a height */
+        if (!wasError) {
+            updateLayout();
+        }
         cameraPlaceholder.css('opacity', 1);
         cameraProgress.removeClass('visible');
         cameraFrameDiv.removeClass('motion-detected');
         cameraFpsSpan.html('');
     };
     cameraImg[0].onload = function () {
+        var wasError = this.error;
         if (this.error) {
             cameraImg.removeClass('error');
             cameraPlaceholder.css('opacity', 0);
-            cameraImg.css('height', '');
+            cameraImg.css('aspect-ratio', '');
             this.error = false;
         }
 
@@ -4992,10 +5260,13 @@ function addCameraFrameUi(cameraConfig) {
         if (this.initializing) {
             cameraProgress.removeClass('visible');
             cameraImg.removeClass('initializing');
-            cameraImg.css('height', '');
+            cameraImg.css('aspect-ratio', '');
             this.initializing = false;
 
             updateLayout();
+        }
+        else if (wasError) {
+            updateLayout(); /* the image replaces the placeholder */
         }
 
         /* there's no point in looking for a cookie update more often than once every second */
@@ -5003,16 +5274,24 @@ function addCameraFrameUi(cameraConfig) {
         if ((!this.lastCookieTime || now - this.lastCookieTime > 1000) && (cameraFrameDiv[0].config['proto'] != 'mjpeg')) {
             if (getCookie('motion_detected_' + cameraId) == 'true') {
                 cameraFrameDiv.addClass('motion-detected');
+                motionEventButton.removeClass('eventstart').addClass('eventend')
+                    .attr('title', i18n.gettext('stop the motion event'));
             }
             else {
                 cameraFrameDiv.removeClass('motion-detected');
+                motionEventButton.removeClass('eventend').addClass('eventstart')
+                    .attr('title', i18n.gettext('start a motion event'));
             }
 
-            if (getCookie('record_active_' + cameraId) == 'true') {
-                recordButton.removeClass('record-start').addClass('record-stop');
-            }
-            else {
-                recordButton.removeClass('record-stop').addClass('record-start');
+            if (cameraConfig.actions.includes('motion_detection')) {
+                if (getCookie('motion_detection_' + cameraId) == 'true') {
+                    motionDetectionButton.removeClass('detectionstart').addClass('detectionpause')
+                        .attr('title', i18n.gettext('pause motion detection'));
+                }
+                else {
+                    motionDetectionButton.removeClass('detectionpause').addClass('detectionstart')
+                        .attr('title', i18n.gettext('start motion detection'));
+                }
             }
 
             var captureFps = getCookie('capture_fps_' + cameraId);
@@ -5068,39 +5347,41 @@ function addCameraFrameUi(cameraConfig) {
 
     cameraImg.addClass('initializing');
     cameraImg[0].initializing = true;
-    cameraImg.height(Math.round(cameraImg.width() * 0.75));
+    cameraImg.css('aspect-ratio', '4 / 3'); /* no picture to give a height until the first one is loaded */
 
     function updateActionButtons() {
         /* check if action buttons need one or two rows*/
-        var actionsCount = Math.ceil(cameraConfig.actions.length);
+        let actionsCount = cameraConfig.actions.length;
         if(actionsCount) {
-            var actionButtonWidth = actionButtonDict[cameraConfig.actions[0]].height();
-            var actionsWidth = actionsCount * actionButtonWidth;
-            var cameraWidth = cameraOverlay.find('div.camera-overlay-bottom').width();
-            var flexBasis = (200 / actionsCount);
-            // to account for uneven numbers to space correctly
-            if(actionsCount % 2 == 1){
-                switch (Math.floor(actionsCount/2)) {
-                    case 4:
-                        flexBasis -= 4;
-                        break;
-                    case 5:
-                        flexBasis -= 2.5;
-                        break;
-                    case 6:
-                    case 7:
-                        flexBasis -= 1.5;
-                        break;
-                    case 8:
-                    case 9:
-                    case 10:
-                        flexBasis -= 1;
-                        break;
-                }
+            let cameraWidth = cameraOverlay.find('div.camera-overlay-bottom').width();
+            if (!cameraWidth) {
+                return; /* overlay hidden, updated again when shown */
             }
-            flexBasis += '%';
-            if(cameraWidth <= actionsWidth){
-                actionButtonDiv.css('flex', '1 0' + flexBasis);
+            let actionButtonWidth = actionButtonDict[cameraConfig.actions[0]].height();
+            if (cameraWidth <= actionsCount * actionButtonWidth) {
+                let flexBasis = (200 / actionsCount);
+                // to account for uneven numbers to space correctly
+                if (actionsCount % 2 == 1) {
+                    switch (Math.floor(actionsCount/2)) {
+                        case 4:
+                            flexBasis -= 4;
+                            break;
+                        case 5:
+                            flexBasis -= 2.5;
+                            break;
+                        case 6:
+                        case 7:
+                            flexBasis -= 1.5;
+                            break;
+                        case 8:
+                        case 9:
+                        case 10:
+                            flexBasis -= 1;
+                            break;
+                    }
+                }
+                flexBasis += '%';
+                actionButtonDiv.css('flex', '1 0 ' + flexBasis);
             } else {
                 actionButtonDiv.css('flex', 'none');
             }
@@ -5518,7 +5799,7 @@ $(document).ready(function () {
         layoutPending = true;
         requestAnimationFrame(function () {
             layoutPending = false;
-            updateLayout();
+            chosenLayoutColumns ? updateLayout() : updateLayoutColumns();
         });
     });
 

@@ -38,12 +38,15 @@ if TYPE_CHECKING:
 from argon2 import PasswordHasher
 from tornado.ioloop import IOLoop
 
+import motioneye
 from motioneye import meyectl, motionctl, settings, tasks, uploadservices, utils
 from motioneye.controls import diskctl, smbctl, v4l2ctl
 from motioneye.controls.powerctl import PowerControl
 
 ph = PasswordHasher()
 _CAMERA_CONFIG_FILE_NAME = 'camera-%(id)s.conf'
+# the motionEye version that last saved a camera config, read by migration.py
+CONFIG_VERSION_KEY = '@config_motioneye_version'
 _MAIN_CONFIG_FILE_NAME = 'motion.conf'
 _ACTIONS = [
     'lock',
@@ -135,6 +138,8 @@ _USED_MOTION_OPTIONS = {
     'threshold_tune',
     'videodevice',
     'vid_control_params',
+    'webcontrol_auth_method',
+    'webcontrol_authentication',
     'webcontrol_interface',
     'webcontrol_localhost',
     'webcontrol_parms',
@@ -365,6 +370,10 @@ def get_main(as_lines: bool = False) -> dict | list:
         main_config['@client_secret'] = client_secret
         save_needed = True
 
+    if _set_motion_control_auth(main_config):
+        logging.info('Applying motion control interface authentication to config file')
+        save_needed = True
+
     if save_needed:
         logging.info('Saving migrated passwords and secrets to config file')
         # Cache must be set before calling set_main to avoid AttributeError
@@ -555,7 +564,7 @@ def get_camera(camera_id: int, as_lines: bool = False) -> dict | list:
 
             except Exception as e:
                 logging.error(
-                    f'failed to chown 0600 camera config file {camera_config_path}: {e}'
+                    f'failed to chmod 0600 camera config file {camera_config_path}: {e}'
                 )
                 raise
 
@@ -589,6 +598,7 @@ def get_camera(camera_id: int, as_lines: bool = False) -> dict | list:
             '@upload_bucket',
             '@upload_sse_c_key',
             '@remote_secret',
+            CONFIG_VERSION_KEY,
             *_NOTIFICATION_KEYS,
             'camera_name',
         ],
@@ -610,7 +620,9 @@ def get_camera(camera_id: int, as_lines: bool = False) -> dict | list:
         _set_default_motion_camera(camera_id, camera_config)
 
     elif utils.is_remote_camera(camera_config):
-        pass
+        camera_config['@remote_verify'] = utils.verify_setting(
+            camera_config.get('@remote_verify')
+        )
 
     elif utils.is_simple_mjpeg_camera(camera_config):
         _set_default_simple_mjpeg_camera(camera_id, camera_config)
@@ -628,6 +640,7 @@ def get_camera(camera_id: int, as_lines: bool = False) -> dict | list:
 
 def set_camera(camera_id: int, camera_config: dict) -> None:
     camera_config['@id'] = camera_id
+    camera_config[CONFIG_VERSION_KEY] = motioneye.VERSION
     _camera_config_cache[camera_id] = camera_config
 
     camera_config = dict(camera_config)
@@ -710,6 +723,7 @@ SENDMAIL_KEYS = {
     'account': '@email_notifications_smtp_account',
     'password': '@email_notifications_smtp_password',  # nosec: B105
     'tls': '@email_notifications_smtp_tls',
+    'verify': '@email_notifications_smtp_verify',
     'sender': '@email_notifications_from',
     'to': '@email_notifications_addresses',
     'timespan': '@email_notifications_picture_time_span',
@@ -720,16 +734,18 @@ SENDTELEGRAM_KEYS = {
     'timespan': '@telegram_notifications_picture_time_span',
 }
 _NOTIFICATION_KEYS = [*SENDMAIL_KEYS.values(), *SENDTELEGRAM_KEYS.values()]
+_OPTIONAL_NOTIFICATION_KEYS = {SENDMAIL_KEYS['verify']}  # absent in older camera files
 MOMENT = '%Y-%m-%dT%H:%M:%S'  # the event time, expanded by motion
 _SHORT = f" %t '{MOMENT}'"
 
 
 def get_notification_settings(camera_id: int | None, keys: dict) -> dict | None:
     camera_config = get_camera(camera_id) if camera_id is not None else None
-    if not camera_config or not all(key in camera_config for key in keys.values()):
+    required = [key for key in keys.values() if key not in _OPTIONAL_NOTIFICATION_KEYS]
+    if not camera_config or not all(key in camera_config for key in required):
         return None  # e.g. disabled since motion was started
 
-    return {name: camera_config[key] for name, key in keys.items()}
+    return {name: camera_config.get(key) for name, key in keys.items()}
 
 
 def notification_command(data: dict, name: str, values: dict) -> str:
@@ -749,7 +765,11 @@ def _settings_to_ui(data: dict, keys: dict) -> dict:
     ui: dict = {key[1:]: str(data.get(key, '')) for key in keys.values()}
     for name, value in ui.items():
         if name.endswith('_tls'):
-            ui[name] = value.lower() == 'true'
+            # 'implicit' is TLS from the start, True STARTTLS
+            ui[name] = value if value == 'implicit' else value.lower() == 'true'
+
+        elif name.endswith('_verify'):
+            ui[name] = utils.verify_setting(value)
 
         elif name.endswith('_time_span'):
             ui[name] = int(value) if value.isdigit() else 0
@@ -837,6 +857,10 @@ def add_camera(device_details: dict) -> dict:
 
         if device_details.get('remote_secret'):
             camera_config['@remote_secret'] = device_details['remote_secret']
+
+        camera_config['@remote_verify'] = utils.verify_setting(
+            device_details.get('remote_verify')
+        )
 
     elif proto == 'mmal':
         camera_config['mmalcam_name'] = device_details['path']
@@ -1006,6 +1030,12 @@ def input_sanity_check(regex: str, value: str, key: str, msg: str) -> str:
         )
 
 
+def input_or_stored(ui: dict, key: str, prev_config: dict, default):
+    # keep the stored setting if the client does not send it, e.g. in case of
+    # a hub running an older release and for keys not shared, like admin-only
+    return ui.get(key, prev_config.get(f'@{key}', default))
+
+
 def input_required(ui, key):
     # False and 0 are set values, a missing key, None (null) or '' is not
     value = ui.get(key)
@@ -1013,6 +1043,11 @@ def input_required(ui, key):
         raise ValueError(f'Setting "{key}" must be set')
 
     return value
+
+
+def _hook_verified(prev_config: dict, option: str) -> bool:
+    # what the stored hook line says, for a client that does not send the key
+    return '--no-verify' not in str(prev_config.get(option, ''))
 
 
 def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
@@ -1051,7 +1086,7 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
             deviceNameValidRegExp, ui['name'], 'camera_name', deviceNameFailMessage
         ),
         '@enabled': ui['enabled'],
-        '@admin_only': ui.get('admin_only', False),
+        '@admin_only': input_or_stored(ui, 'admin_only', prev_config, False),
         'auto_brightness': ui['auto_brightness'],
         'framerate': int(ui['framerate']),
         'rotate': int(ui['rotation']),
@@ -1074,13 +1109,15 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
         '@upload_subfolders': ui['upload_subfolders'],
         '@upload_username': ui['upload_username'],
         '@upload_password': ui['upload_password'],
+        '@upload_tls': input_or_stored(ui, 'upload_tls', prev_config, False),
+        '@upload_verify': input_or_stored(ui, 'upload_verify', prev_config, True),
         '@upload_endpoint_url': ui['upload_endpoint_url'],
         '@upload_access_key': ui['upload_access_key'],
         '@upload_secret_key': ui['upload_secret_key'],
         '@upload_bucket': ui['upload_bucket'],
         '@upload_sse_c_key': ui['upload_sse_c_key'],
         '@clean_cloud_enabled': ui['clean_cloud_enabled'],
-        '@clean_uploaded': ui['clean_uploaded'],
+        '@clean_uploaded': input_or_stored(ui, 'clean_uploaded', prev_config, False),
         # text overlay
         'text_left': '',
         'text_right': '',
@@ -1119,6 +1156,12 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
         '@preserve_movies': int(ui['preserve_movies']),
         # motion detection
         '@motion_detection': ui['motion_detection'],
+        '@motion_event_button': input_or_stored(
+            ui, 'motion_event_button', prev_config, False
+        ),
+        '@motion_detection_button': input_or_stored(
+            ui, 'motion_detection_button', prev_config, False
+        ),
         'emulate_motion': False,
         'text_changes': ui['show_frame_changes'],
         'locate_motion_mode': ui['show_frame_changes'],
@@ -1426,6 +1469,8 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
 
     # event start
     on_event_start = [f"{meyectl.find_command('relayevent')} start %t"]
+    # kept for a client that does not send the key
+    stored_mail_verify = prev_config.get(SENDMAIL_KEYS['verify'])
     for key in _NOTIFICATION_KEYS:  # stored only while enabled
         prev_config.pop(key, None)
 
@@ -1451,7 +1496,14 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
         else:
             email_from = ''
 
-        values = {key: ui[key[1:]] for key in SENDMAIL_KEYS.values()}
+        values = {
+            key: ui[key[1:]]
+            for key in SENDMAIL_KEYS.values()
+            if key != SENDMAIL_KEYS['verify']
+        }
+        values[SENDMAIL_KEYS['verify']] = utils.verify_setting(
+            ui.get('email_notifications_smtp_verify', stored_mail_verify)
+        )
         values['@email_notifications_addresses'] = emails
         values['@email_notifications_from'] = email_from
         on_event_start.append(notification_command(data, 'sendmail', values))
@@ -1471,10 +1523,17 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
                 webHookUrlFailMessage,
             ),
         )
+        verify = utils.verify_setting(
+            ui.get(
+                'web_hook_notifications_verify',
+                _hook_verified(prev_config, 'on_event_start'),
+            )
+        )
 
         on_event_start.append(
-            "{script} '{method}' '{url}'".format(
+            "{script}{flag} '{method}' '{url}'".format(
                 script=meyectl.find_command('webhook'),
+                flag='' if verify else ' --no-verify',
                 method=ui['web_hook_notifications_http_method'],
                 url=url,
             )
@@ -1499,10 +1558,17 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
                 webHookUrlFailMessage,
             ),
         )
+        verify = utils.verify_setting(
+            ui.get(
+                'web_hook_end_notifications_verify',
+                _hook_verified(prev_config, 'on_event_end'),
+            )
+        )
 
         on_event_end.append(
-            "{script} '{method}' '{url}'".format(
+            "{script}{flag} '{method}' '{url}'".format(
                 script=meyectl.find_command('webhook'),
+                flag='' if verify else ' --no-verify',
                 method=ui['web_hook_end_notifications_http_method'],
                 url=url,
             )
@@ -1514,10 +1580,18 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
     data['on_event_end'] = '; '.join(on_event_end)
 
     # movie end
+    previous_movie_end = prev_config.get('on_movie_end') or []
+    if isinstance(previous_movie_end, str):
+        previous_movie_end = utils.split_semicolon(previous_movie_end)
+
     on_movie_end = [f"{meyectl.find_command('relayevent')} movie_end %t %f"]
 
     if ui['telegram_notifications_enabled'] and ui.get(
-        'telegram_notifications_send_video', False
+        'telegram_notifications_send_video',
+        any(
+            ' sendtelegram ' in command and command.endswith(_SHORT + ' --movie "%f"')
+            for command in previous_movie_end
+        ),
     ):
         on_movie_end.append(
             meyectl.find_command('sendtelegram') + _SHORT + ' --movie "%f"'
@@ -1534,10 +1608,16 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
                 webHookUrlFailMessage,
             ),
         )
+        verify = utils.verify_setting(
+            ui.get(
+                'web_hook_storage_verify', _hook_verified(prev_config, 'on_movie_end')
+            )
+        )
 
         on_movie_end.append(
-            "{script} '{method}' '{url}'".format(
+            "{script}{flag} '{method}' '{url}'".format(
                 script=meyectl.find_command('webhook'),
+                flag='' if verify else ' --no-verify',
                 method=ui['web_hook_storage_http_method'],
                 url=url,
             )
@@ -1562,10 +1642,16 @@ def motion_camera_ui_to_dict(ui: dict, prev_config: dict | None = None) -> dict:
                 webHookUrlFailMessage,
             ),
         )
+        verify = utils.verify_setting(
+            ui.get(
+                'web_hook_storage_verify', _hook_verified(prev_config, 'on_movie_end')
+            )
+        )
 
         on_picture_save.append(
-            "{script} '{method}' '{url}'".format(
+            "{script}{flag} '{method}' '{url}'".format(
                 script=meyectl.find_command('webhook'),
+                flag='' if verify else ' --no-verify',
                 method=ui['web_hook_storage_http_method'],
                 url=url,
             )
@@ -1624,6 +1710,8 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
         'upload_subfolders': data['@upload_subfolders'],
         'upload_username': data['@upload_username'],
         'upload_password': data['@upload_password'],
+        'upload_tls': data['@upload_tls'],
+        'upload_verify': data['@upload_verify'],
         'upload_authorization_key': '',  # needed, otherwise the field is hidden
         'upload_endpoint_url': data['@upload_endpoint_url'],
         'upload_access_key': data['@upload_access_key'],
@@ -1633,6 +1721,7 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
         'clean_cloud_enabled': data['@clean_cloud_enabled'],
         'clean_uploaded': data['@clean_uploaded'],
         'web_hook_storage_enabled': False,
+        'web_hook_storage_verify': True,
         'command_storage_enabled': False,
         # text overlay
         'text_overlay': False,
@@ -1668,6 +1757,8 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
         'movie_passthrough': data['movie_passthrough'],
         # motion detection
         'motion_detection': data['@motion_detection'],
+        'motion_event_button': data['@motion_event_button'],
+        'motion_detection_button': data['@motion_detection_button'],
         'show_frame_changes': data['text_changes'] or data['locate_motion_mode'],
         'auto_noise_detect': data['noise_tune'],
         'max_frame_change_threshold': data['threshold_maximum'],
@@ -1689,7 +1780,9 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
         'email_notifications_enabled': False,
         'telegram_notifications_enabled': False,
         'web_hook_notifications_enabled': False,
+        'web_hook_notifications_verify': True,
         'web_hook_end_notifications_enabled': False,
+        'web_hook_end_notifications_verify': True,
         'command_notifications_enabled': False,
         'command_end_notifications_enabled': False,
         # working schedule
@@ -1996,6 +2089,7 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
             ui['web_hook_notifications_enabled'] = True
             ui['web_hook_notifications_http_method'] = e[-2]
             ui['web_hook_notifications_url'] = e[-1]
+            ui['web_hook_notifications_verify'] = '--no-verify' not in e[:-2]
 
         elif 'relayevent' in e:
             continue  # ignore internal relay script
@@ -2023,6 +2117,7 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
             ui['web_hook_end_notifications_enabled'] = True
             ui['web_hook_end_notifications_http_method'] = e[-2]
             ui['web_hook_end_notifications_url'] = e[-1]
+            ui['web_hook_end_notifications_verify'] = '--no-verify' not in e[:-2]
 
         elif 'relayevent' in e or 'eventrelay.py' in e:
             continue  # ignore internal relay script
@@ -2053,6 +2148,7 @@ def motion_camera_dict_to_ui(data: dict) -> dict:
             ui['web_hook_storage_enabled'] = True
             ui['web_hook_storage_http_method'] = e[-2]
             ui['web_hook_storage_url'] = e[-1]
+            ui['web_hook_storage_verify'] = '--no-verify' not in e[:-2]
 
         elif 'relayevent' in e:
             continue  # ignore internal relay script
@@ -2090,7 +2186,7 @@ def simple_mjpeg_camera_ui_to_dict(ui: dict, prev_config: dict | None = None):
         # device
         'camera_name': ui['name'],
         '@enabled': ui['enabled'],
-        '@admin_only': ui.get('admin_only', False),
+        '@admin_only': input_or_stored(ui, 'admin_only', prev_config, False),
     }
 
     prev_config.update(data)
@@ -2129,8 +2225,11 @@ def get_action_commands(camera_config: dict) -> dict:
     ):
         action_commands['snapshot'] = True
 
-    if camera_config.get('@manual_record'):
-        action_commands['record'] = True
+    if camera_config.get('@motion_event_button'):
+        action_commands['motion_event'] = True
+
+    if camera_config.get('@motion_detection_button'):
+        action_commands['motion_detection'] = True
 
     return action_commands
 
@@ -2156,7 +2255,7 @@ def backup() -> bytes | None:
 
     files = [
         f
-        for p in ('motion.conf', 'camera-*.conf', 'mask_*.pgm', 'prefs.json')
+        for p in ('motion.conf', 'camera-*.conf', 'mask_*.pgm')
         for f in glob(os.path.join(settings.CONF_PATH, p))
     ]
 
@@ -2177,7 +2276,7 @@ def backup() -> bytes | None:
 def restore(content: bytes) -> dict | None:
     logging.info('restoring config from backup file')
 
-    patterns = ['motion.conf', 'camera-*.conf', 'mask_*.pgm', 'prefs.json']
+    patterns = ['motion.conf', 'camera-*.conf', 'mask_*.pgm']
 
     try:
         with tarfile.open(fileobj=BytesIO(content)) as tf:
@@ -2417,8 +2516,26 @@ def _set_default_motion(data: dict) -> None:
     data.setdefault('webcontrol_port', settings.MOTION_CONTROL_PORT)
     data.setdefault('webcontrol_interface', 1)
     data.setdefault('webcontrol_localhost', settings.MOTION_CONTROL_LOCALHOST)
-    # the advanced list of parameters will be available
-    data.setdefault('webcontrol_parms', 2)
+    data.setdefault('webcontrol_parms', 0)
+
+
+def _set_motion_control_auth(data: dict) -> bool:
+    # motionEye sends the credentials from motioneye.conf with each request to
+    # the control interface, hence they always override those in motion.conf
+    old = (data.get('webcontrol_authentication'), data.get('webcontrol_auth_method'))
+
+    if settings.MOTION_CONTROL_AUTHENTICATION:
+        data['webcontrol_authentication'] = settings.MOTION_CONTROL_AUTHENTICATION
+        data['webcontrol_auth_method'] = 1  # basic
+
+    else:
+        data.pop('webcontrol_authentication', None)
+        data.pop('webcontrol_auth_method', None)
+
+    return old != (
+        data.get('webcontrol_authentication'),
+        data.get('webcontrol_auth_method'),
+    )
 
 
 def _set_default_motion_camera(camera_id: int, data: dict) -> None:
@@ -2457,6 +2574,8 @@ def _set_default_motion_camera(camera_id: int, data: dict) -> None:
     data.setdefault('@upload_subfolders', True)
     data.setdefault('@upload_username', '')
     data.setdefault('@upload_password', '')
+    data.setdefault('@upload_tls', False)
+    data.setdefault('@upload_verify', True)
     data.setdefault('@upload_endpoint_url', '')
     data.setdefault('@upload_access_key', '')
     data.setdefault('@upload_secret_key', '')
@@ -2480,6 +2599,8 @@ def _set_default_motion_camera(camera_id: int, data: dict) -> None:
     data.setdefault('text_scale', 1)
 
     data.setdefault('@motion_detection', True)
+    data.setdefault('@motion_event_button', False)
+    data.setdefault('@motion_detection_button', False)
     data.setdefault('text_changes', False)
     data.setdefault('locate_motion_mode', False)
     data.setdefault('locate_motion_style', 'redbox')
@@ -2528,7 +2649,6 @@ def _set_default_motion_camera(camera_id: int, data: dict) -> None:
     data.setdefault('movie_quality', 75)  # 75%
 
     data.setdefault('@preserve_movies', 0)
-    data.setdefault('@manual_record', False)
 
     data.setdefault('@working_schedule', '')
     data.setdefault('@working_schedule_type', 'outside')

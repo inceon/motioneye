@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from datetime import datetime
@@ -24,6 +25,8 @@ from tempfile import mkdtemp
 from time import time
 from typing import ClassVar
 from unittest.mock import patch
+
+from tornado.testing import AsyncTestCase, gen_test
 
 from motioneye import mediafiles
 from motioneye.mediafiles import _list_media_files
@@ -641,6 +644,45 @@ class TestMediaFilesPathValidation(unittest.TestCase):
                 )
 
 
+class TestTimelapseMovie(AsyncTestCase):
+    """A timelapse that fails to start must not block the next one (#1081)."""
+
+    def setUp(self):
+        super().setUp()
+        self.target_dir = mkdtemp()
+        self.addCleanup(rmtree, self.target_dir, ignore_errors=True)
+        media_path = patch.object(mediafiles.settings, 'MEDIA_PATH', self.target_dir)
+        media_path.start()
+        self.addCleanup(media_path.stop)
+        process = patch.object(mediafiles, '_timelapse_process', None)
+        process.start()
+        self.addCleanup(process.stop)
+
+    @gen_test(timeout=30)
+    async def test_ffmpeg_that_cannot_start_ends_the_timelapse(self):
+        group = os.path.join(self.target_dir, '2024-01-01')
+        os.mkdir(group)
+        for i in range(5):
+            path = os.path.join(group, f'{i}.jpg')
+            Path(path).touch()
+            os.utime(path, (1000 + i * 10, 1000 + i * 10))
+
+        camera_config = {'target_dir': self.target_dir, 'movie_codec': 'mp4:h264'}
+        no_ffmpeg = patch.object(
+            mediafiles.subprocess, 'Popen', side_effect=FileNotFoundError('ffmpeg')
+        )
+        with no_ffmpeg, self.assertLogs(level='ERROR'):
+            mediafiles.make_timelapse_movie(camera_config, 20, 10, '2024-01-01')
+            for _ in range(100):
+                await asyncio.sleep(0.1)
+                if mediafiles.check_timelapse_movie()['progress'] == -1:
+                    break
+
+        self.assertEqual(
+            {'progress': -1, 'data': None}, mediafiles.check_timelapse_movie()
+        )
+
+
 class TestRemoveOlderFiles(unittest.TestCase):
     _CLOUD_INFO: ClassVar[dict] = {
         'camera_id': 1,
@@ -649,14 +691,15 @@ class TestRemoveOlderFiles(unittest.TestCase):
     }
 
     def setUp(self):
-        self.target_dir = mkdtemp()
-        # cleanup_media() creates this, so the target dir itself is never removed
-        Path(self.target_dir, '.keep').touch()
+        # in a parent directory, to check that it is kept as well
+        self.parent_dir = mkdtemp()
+        self.target_dir = os.path.join(self.parent_dir, 'Camera1')
+        os.mkdir(self.target_dir)
         self.now = time()
         self.moment = datetime.fromtimestamp(self.now - 3 * 86400)
 
     def tearDown(self):
-        rmtree(self.target_dir, ignore_errors=True)
+        rmtree(self.parent_dir, ignore_errors=True)
 
     def _file(self, rel_path, age_days):
         path = os.path.join(self.target_dir, rel_path)
@@ -686,9 +729,7 @@ class TestRemoveOlderFiles(unittest.TestCase):
 
         self._remove(['.jpg'])
 
-        self.assertEqual(
-            self._files(), ['.keep', os.path.join('2024-01-01', 'new.jpg')]
-        )
+        self.assertEqual(self._files(), [os.path.join('2024-01-01', 'new.jpg')])
 
     def test_removes_emptied_folders_but_not_the_target_dir(self):
         self._file('old0.jpg', 4)
@@ -700,8 +741,9 @@ class TestRemoveOlderFiles(unittest.TestCase):
 
         self._remove(['.jpg'])
 
-        self.assertEqual(self._files(), ['.keep'])
-        self.assertEqual(os.listdir(self.target_dir), ['.keep'])
+        self.assertEqual(self._files(), [])
+        self.assertEqual(os.listdir(self.target_dir), [])
+        self.assertEqual(os.listdir(self.parent_dir), ['Camera1'])
 
     def test_removes_left_over_thumbs(self):
         # a movie preview made later than the movie keeps a newer timestamp
@@ -710,7 +752,7 @@ class TestRemoveOlderFiles(unittest.TestCase):
 
         self._remove(['.mp4', '.thumb'])
 
-        self.assertEqual(self._files(), ['.keep'])
+        self.assertEqual(self._files(), [])
 
     def test_keeps_folders_with_other_files(self):
         self._file('2024-01-01/old.jpg', 4)
@@ -724,7 +766,6 @@ class TestRemoveOlderFiles(unittest.TestCase):
         self.assertEqual(
             self._files(),
             [
-                '.keep',
                 os.path.join('2024-01-01', 'notes.txt'),
                 os.path.join('2024-01-02', 'new.mp4.thumb'),
                 os.path.join('2024-01-02', 'old.mp4'),
@@ -741,7 +782,7 @@ class TestRemoveOlderFiles(unittest.TestCase):
 
         self._remove(['.mp4', '.thumb'])
 
-        self.assertEqual(self._files(), ['.keep'])
+        self.assertEqual(self._files(), [])
 
     def test_cleans_cloud_only_when_a_folder_was_removed(self):
         self._file('2024-01-01/old.jpg', 4)
@@ -770,9 +811,7 @@ class TestRemoveOlderFiles(unittest.TestCase):
             with self.assertLogs(level='ERROR'):
                 self._remove(['.jpg'])
 
-        self.assertEqual(
-            self._files(), ['.keep', os.path.join('2024-01-01', 'bad.jpg')]
-        )
+        self.assertEqual(self._files(), [os.path.join('2024-01-01', 'bad.jpg')])
 
     def test_goes_on_after_a_folder_it_cannot_list(self):
         # the deeper folder is checked first
@@ -793,7 +832,7 @@ class TestRemoveOlderFiles(unittest.TestCase):
         ):
             self._remove(['.jpg'])
 
-        self.assertEqual(sorted(os.listdir(self.target_dir)), ['.keep', 'a'])
+        self.assertEqual(sorted(os.listdir(self.target_dir)), ['a'])
         self.assertTrue(os.path.isdir(locked))
 
     def test_lists_each_folder_once(self):
@@ -809,9 +848,84 @@ class TestRemoveOlderFiles(unittest.TestCase):
             [c.args[0] for c in listdir.call_args_list],
             [os.path.join(self.target_dir, '2024-01-01')],
         )
+        self.assertEqual(self._files(), [os.path.join('2024-01-01', 'new.jpg')])
+
+
+class TestDelMedia(unittest.TestCase):
+    def setUp(self):
+        # in a parent directory, to check that it is kept as well
+        self.parent_dir = mkdtemp()
+        self.target_dir = os.path.join(self.parent_dir, 'Camera1')
+        os.mkdir(self.target_dir)
+        self.camera_config = {'target_dir': self.target_dir}
+
+    def tearDown(self):
+        rmtree(self.parent_dir, ignore_errors=True)
+
+    def _file(self, rel_path):
+        path = os.path.join(self.target_dir, rel_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        Path(path).touch()
+
+    def _assert_only_target_dir_left(self):
+        self.assertEqual(os.listdir(self.parent_dir), ['Camera1'])
+        self.assertEqual(os.listdir(self.target_dir), [])
+
+    def test_del_media_content_removes_emptied_folders_but_not_the_target_dir(self):
+        self._file('a/2024-01-01/old.mp4')
+        self._file('a/2024-01-01/old.mp4.thumb')
+
+        mediafiles.del_media_content(self.camera_config, 'a/2024-01-01/old.mp4')
+
+        self._assert_only_target_dir_left()
+
+    def test_del_media_content_of_a_file_in_the_target_dir(self):
+        self._file('old.jpg')
+
+        mediafiles.del_media_content(self.camera_config, 'old.jpg')
+
+        self._assert_only_target_dir_left()
+
+    def test_del_media_content_keeps_folders_with_other_files(self):
+        self._file('2024-01-01/old.jpg')
+        self._file('2024-01-01/new.jpg')
+
+        mediafiles.del_media_content(self.camera_config, '2024-01-01/old.jpg')
+
         self.assertEqual(
-            self._files(), ['.keep', os.path.join('2024-01-01', 'new.jpg')]
+            os.listdir(os.path.join(self.target_dir, '2024-01-01')), ['new.jpg']
         )
+
+    def test_del_media_group_removes_the_group_but_not_the_target_dir(self):
+        self._file('2024-01-01/old1.jpg')
+        self._file('2024-01-01/old2.jpg')
+
+        mediafiles.del_media_group(self.camera_config, '2024-01-01', 'picture')
+
+        self._assert_only_target_dir_left()
+
+    def test_del_media_group_of_the_ungrouped_files(self):
+        self._file('old1.jpg')
+        self._file('old2.jpg')
+
+        mediafiles.del_media_group(self.camera_config, '', 'picture')
+
+        self._assert_only_target_dir_left()
+
+    def test_no_keep_file_is_written(self):
+        # it cannot be written again once hidden on some SMB shares (#1810), and an
+        # existing one is left alone
+        self._file('2024-01-01/old.jpg')
+        mediafiles.del_media_content(self.camera_config, '2024-01-01/old.jpg')
+        self.assertFalse(os.path.exists(os.path.join(self.target_dir, '.keep')))
+
+        self._file('.keep')
+        self._file('2024-01-01/old.jpg')
+        with patch('builtins.open', side_effect=PermissionError(13, 'denied')):
+            mediafiles.del_media_content(self.camera_config, '2024-01-01/old.jpg')
+            mediafiles.del_media_group(self.camera_config, '', 'picture')
+
+        self.assertEqual(os.listdir(self.target_dir), ['.keep'])
 
 
 if __name__ == '__main__':

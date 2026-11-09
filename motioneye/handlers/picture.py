@@ -222,10 +222,20 @@ class PictureHandler(BaseHandler):
                 'monitor_info_' + camera_id_str, monitor.get_monitor_info(camera_id)
             )
 
+            if camera_config.get('@motion_detection_button', False):
+                response: utils.GetMotionDetectionResult = (
+                    await motionctl.get_motion_detection(camera_id)
+                )
+                if response.error is None:
+                    self.set_cookie(
+                        'motion_detection_' + camera_id_str,
+                        str(response.enabled).lower(),
+                    )
+
             return self.try_finish(picture)
 
         elif utils.is_remote_camera(camera_config):
-            resp = await remote.get_current_picture(
+            resp: utils.GetCurrentPictureResponse = await remote.get_current_picture(
                 camera_config, width=width, height=height
             )
             if resp.error:
@@ -239,6 +249,12 @@ class PictureHandler(BaseHandler):
                 'monitor_info_' + camera_id_str,
                 quote(unquote(resp.monitor_info or ''), safe=''),
             )
+
+            if resp.motion_detection is not None:
+                self.set_cookie(
+                    'motion_detection_' + camera_id_str,
+                    str(resp.motion_detection).lower(),
+                )
 
             return self.try_finish(resp.picture)
 
@@ -508,6 +524,8 @@ class PictureHandler(BaseHandler):
                 raise HTTPError(400, 'unknown operation')
 
         else:  # prepare
+            self.refuse_navigation()
+
             logging.debug(
                 f'preparing zip file for group "{group}" of camera {camera_id}'
             )
@@ -634,6 +652,8 @@ class PictureHandler(BaseHandler):
                 raise HTTPError(400, 'unknown operation')
 
         else:  # start timelapse
+            self.refuse_navigation()
+
             interval = int(self.get_argument('interval'))
             framerate = int(self.get_argument('framerate'))
 

@@ -211,6 +211,11 @@
                             <td><span class="help-mark" title="{{ _("edit the camera URL and credentials") }}">?</span></td>
                         </tr>
                         <tr class="settings-item">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled device camera-config" id="remoteVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the remote motionEye's TLS certificate against the trusted authorities of this system; turn this off only for a remote with a self-signed certificate that you trust; the connection is then still encrypted, but the remote is not authenticated") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("Admin-only access") }}</span></td>
                             <td class="settings-item-value"><input type="checkbox" class="styled device camera-config" id="adminOnlySwitch"></td>
                             <td><span class="help-mark" title="{{ _("If enabled only the admin user can access this camera") }}">?</span></td>
@@ -394,6 +399,11 @@
                             </td>
                             <td><span class="help-mark" title="{{ _("elektu servon, al kiu la mediadosieroj estu alŝutitaj") }}">?</span></td>
                         </tr>
+                        <tr class="settings-item" depends="uploadEnabled uploadService=(ftp)">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Use TLS (FTPS)") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled storage camera-config" id="uploadTlsSwitch"></td>
+                            <td><span class="help-mark" title="{{ _("encrypt the connection with explicit TLS on the normal FTP port (usually 21), the way most servers offer it; implicit TLS on port 990 is not supported") }}">?</span></td>
+                        </tr>
                         <tr class="settings-item" required="true" depends="uploadEnabled uploadService=(ftp|sftp|http|https)">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("Servila Adreso") }}</span></td>
                             <td class="settings-item-value"><input type="text" class="styled storage camera-config" id="uploadServerEntry"></td>
@@ -420,6 +430,11 @@
                             <td><span class="help-mark" title="{{ _("La kompleta URL al la alŝuta servila finpunkto:") }}
       {{ _("Por S3: ekz. http://my.minio:9000. Lasu ĝin malplena por AWS!") }}
       {{ _("Por WebDAV: ekz. https://my.cloud/remote.php/dav/files/Me/") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item" depends="uploadEnabled uploadService=(ftp|s3|webdav)">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled storage camera-config" id="uploadVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the server's TLS certificate against the trusted authorities of this system; turn this off only for a server with a self-signed certificate that you trust; the connection is then still encrypted, but the server is not authenticated") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" required="true" depends="uploadEnabled uploadService!=(s3)">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("Loko") }}</span></td>
@@ -454,7 +469,7 @@
                         <tr class="settings-item" depends="uploadEnabled uploadService=(gdrive|gphoto|dropbox)">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("Rajtiga ŝlosilo") }}</span></td>
                             <td class="settings-item-value"><input type="password" autocomplete="new-password" class="styled storage camera-config" id="uploadAuthorizationKeyEntry"></td>
-                            <td><span class="help-mark" title="{{ _("la ŝlosilo uzata por aŭtentiĝi kun la alŝuta servo (kutime bezonata nur dum agordo)") }}">?</span></td>
+                            <td><span class="help-mark" title="{{ _("the key used to authenticate with the upload service, usually only needed during setup; for Google, the whole address of the page that cannot be loaded after allowing access") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" depends="uploadEnabled uploadService=(gdrive|gphoto|dropbox)">
                             <td class="settings-item-label"><span class="settings-item-label"></span></td>
@@ -514,6 +529,11 @@
                                 </select>
                             </td>
                             <td><span class="help-mark" title="{{ _("la HTTP-metodo por uzi kiam vi petas retan hoko-URL (la donitaj URL-koditaj parametroj fakte estos transdonitaj kiel indikite ĉi tie)") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item" depends="webHookStorageEnabled">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled storage camera-config" id="webHookStorageVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the server's TLS certificate against the trusted authorities of this system; turn this off only for a server with a self-signed certificate that you trust; the connection is then still encrypted, but the server is not authenticated") }}">?</span></td>
                         </tr>
                         <tr class="settings-item">
                             <td colspan="100"><div class="settings-item-separator"></div></td>
@@ -957,6 +977,16 @@
                             <td class="settings-item-value"><input type="checkbox" class="styled motion-detection camera-config" id="createDebugMediaSwitch"></td>
                             <td><span class="help-mark" title="{{ _("Kiam ebligite, kreas specialajn filmojn kaj bildojn, kiuj helpas elpurigi problemojn de moviĝo-detekto.") }}">?</span></td>
                         </tr>
+                        <tr class="settings-item">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Manual motion event button") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled motion-detection camera-config" id="motionEventButtonSwitch"></td>
+                            <td><span class="help-mark" title="{{ _("If enabled, an action button is added to the camera frame, which allows to start and end a manual motion event. This can be used to manually create motion-triggered recordings, and test the motion notification pipeline.") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Motion detection toggle button") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled motion-detection camera-config" id="motionDetectionButtonSwitch"></td>
+                            <td><span class="help-mark" title="{{ _("If enabled, an action button is added to the camera frame, which allows to temporarily pause and reactivate motion detection. Saving settings, adding/removing cameras, and restarting motionEye resets the state.") }}">?</span></td>
+                        </tr>
                     </table>
 
                     <!-- Motion Notifications -->
@@ -991,7 +1021,7 @@
                         <tr class="settings-item" min="1" max="65535" depends="emailNotificationsEnabled motionDetectionEnabled" required="true">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("SMTP Haveno") }}</span></td>
                             <td class="settings-item-value"><input type="text" class="styled number notifications camera-config" id="smtpPortEntry" placeholder="{{ _("ekz. 587") }}"></td>
-                            <td><span class="help-mark" title="{{ _("Eniru la havenon uzatan de via SMTP-servilo (kutime 465 por ne-TLS-ligoj kaj 587 por TLS-ligoj).") }}">?</span></td>
+                            <td><span class="help-mark" title="{{ _("the port of your SMTP server: usually 465 for TLS, 587 for STARTTLS, and 25 without encryption; e.g. Gmail accepts 465 with TLS and 587 with STARTTLS") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" depends="emailNotificationsEnabled motionDetectionEnabled" strip="true">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("SMTP-Konto") }}</span></td>
@@ -1001,7 +1031,7 @@
                         <tr class="settings-item" depends="emailNotificationsEnabled motionDetectionEnabled" strip="true">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("SMTP Pasvorto") }}</span></td>
                             <td class="settings-item-value"><input type="password" autocomplete="new-password" class="styled notifications camera-config" id="smtpPasswordEntry"></td>
-                            <td><span class="help-mark" title="{{ _("Enigu vian SMTPan pasvorton (por Gmail uzu vian Google-pasvorton aŭ app-specifan generitan pasvorton).") }}">?</span></td>
+                            <td><span class="help-mark" title="{{ _("your SMTP account password; for Gmail, use an app password from your Google account, as Gmail refuses the account password itself") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" depends="emailNotificationsEnabled motionDetectionEnabled" strip="true">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("De adreso") }}</span></td>
@@ -1009,9 +1039,20 @@
                             <td><span class="help-mark" title="{{ _("Agordi kutimon De adreso, se via SMTP-servo postulas unu (la unua destina retpoŝta adreso estos uzata se lasita malplena).") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" depends="emailNotificationsEnabled motionDetectionEnabled">
-                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Uzi TLS") }}</span></td>
-                            <td class="settings-item-value"><input type="checkbox" class="styled notifications camera-config" id="smtpTlsSwitch"></td>
-                            <td><span class="help-mark" title="{{ _("Ebligu tion, se via SMTP-servilo postulas TLS (Gmail bezonas ĉi tion por ebligi).") }}">?</span></td>
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Encryption") }}</span></td>
+                            <td class="settings-item-value">
+                                <select class="styled notifications camera-config" id="smtpTlsSelect">
+                                    <option value="none">{{ _("none") }}</option>
+                                    <option value="starttls">STARTTLS</option>
+                                    <option value="tls">TLS</option>
+                                </select>
+                            </td>
+                            <td><span class="help-mark" title="{{ _("how the connection to your SMTP server is encrypted: TLS encrypts it from the start (usually port 465), STARTTLS connects unencrypted and then switches to encryption (usually port 587); choose what your provider names") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item" depends="emailNotificationsEnabled motionDetectionEnabled smtpTls!=none">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled notifications camera-config" id="smtpVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the server's TLS certificate against the trusted authorities of this system; turn this off only for a server with a self-signed certificate that you trust; the connection is then still encrypted, but the server is not authenticated") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" min="0" max="60" required="true" depends="emailNotificationsEnabled motionDetectionEnabled">
                             <td class="settings-item-label"><span class="settings-item-label">{{ _("Aldonitaj bildoj tempo-intervalo") }}</span></td>
@@ -1080,6 +1121,11 @@
                             </td>
                             <td><span class="help-mark" title="{{ _("La HTTP-metodo por uzi kiam vi petas URL (la donitaj URL-parametroj estos transdonitaj kiel indikite ĉi tie).") }}">?</span></td>
                         </tr>
+                        <tr class="settings-item" depends="webHookNotificationsEnabled motionDetectionEnabled">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled notifications camera-config" id="webHookNotificationsVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the server's TLS certificate against the trusted authorities of this system; turn this off only for a server with a self-signed certificate that you trust; the connection is then still encrypted, but the server is not authenticated") }}">?</span></td>
+                        </tr>
                         <tr class="settings-item" depends="motionDetectionEnabled">
                             <td colspan="100"><div class="settings-item-separator"></div></td>
                         </tr>
@@ -1124,6 +1170,11 @@
                                 </select>
                             </td>
                             <td><span class="help-mark" title="{{ _("La HTTP-metodo por uzi kiam vi petas URL (la donitaj URL-parametroj estos transdonitaj kiel indikite ĉi tie).") }}">?</span></td>
+                        </tr>
+                        <tr class="settings-item" depends="webHookEndNotificationsEnabled motionDetectionEnabled">
+                            <td class="settings-item-label"><span class="settings-item-label">{{ _("Verify certificate") }}</span></td>
+                            <td class="settings-item-value"><input type="checkbox" class="styled notifications camera-config" id="webHookEndNotificationsVerifySwitch"></td>
+                            <td><span class="help-mark" title="{{ _("check the server's TLS certificate against the trusted authorities of this system; turn this off only for a server with a self-signed certificate that you trust; the connection is then still encrypted, but the server is not authenticated") }}">?</span></td>
                         </tr>
                         <tr class="settings-item" depends="motionDetectionEnabled">
                             <td colspan="100"><div class="settings-item-separator"></div></td>

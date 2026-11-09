@@ -18,6 +18,7 @@
 import asyncio
 import json
 import logging
+import ssl
 from datetime import datetime
 from socket import gethostname
 from urllib.parse import urlparse
@@ -87,7 +88,7 @@ class ConfigHandler(BaseHandler):
             return self.backup()
 
         elif op == 'authorize':
-            return self.authorize()
+            return await self.authorize(camera_id)
 
         else:
             raise HTTPError(400, 'unknown operation')
@@ -149,6 +150,10 @@ class ConfigHandler(BaseHandler):
             local_config['@path'] = parsed.path or '/'
             if data.get('remote_secret'):
                 local_config['@remote_secret'] = data['remote_secret']
+            if data.get('remote_verify') is not None:
+                local_config['@remote_verify'] = utils.verify_setting(
+                    data['remote_verify']
+                )
             config.set_camera(camera_id, local_config)
             return self.finish_json()
 
@@ -201,6 +206,7 @@ class ConfigHandler(BaseHandler):
                             'connection_url': remote.pretty_camera_url(
                                 local_config, camera=False
                             ),
+                            'remote_verify': local_config.get('@remote_verify', True),
                         }
                     )
 
@@ -257,10 +263,22 @@ class ConfigHandler(BaseHandler):
                 on_finish(None, True)  # (no error, motion needs restart)
 
             elif utils.is_remote_camera(local_config):
+                if ui_config.get('connection_failed'):
+                    # a placeholder for an unreachable camera, posted back as it
+                    # was listed: there is nothing in it to save
+                    return on_finish(
+                        'the remote camera could not be reached, nothing was saved',
+                        False,
+                    )
+
                 # update the camera locally
                 local_config['@enabled'] = ui_config['enabled']
                 if ui_config.get('admin_only') is not None:
                     local_config['@admin_only'] = bool(ui_config.get('admin_only'))
+                if ui_config.get('remote_verify') is not None:
+                    local_config['@remote_verify'] = utils.verify_setting(
+                        ui_config['remote_verify']
+                    )
                 config.set_camera(camera_id, local_config)
 
                 if 'name' in ui_config:
@@ -268,6 +286,7 @@ class ConfigHandler(BaseHandler):
                     ui_config.pop(
                         'admin_only', None
                     )  # local-only setting do not send to remote
+                    ui_config.pop('remote_verify', None)
                     result = await remote.set_config(local_config, ui_config)
                     on_finish(result, False)
 
@@ -439,20 +458,19 @@ class ConfigHandler(BaseHandler):
 
         if resp.error:
             msg = f'Failed to get remote camera configuration for {remote.pretty_camera_url(local_config)}: {resp.error}.'
-            cameras.append(
-                {
-                    'id': camera_id,
-                    'name': f'Camera {camera_id} - Connection failed',
-                    'enabled': False,
-                    'connection_failed': True,
-                    'connection_error': msg,
-                    'connection_url': remote.pretty_camera_url(
-                        local_config, camera=False
-                    ),
-                    'streaming_framerate': 1,
-                    'framerate': 1,
-                }
-            )
+            entry = {
+                'id': camera_id,
+                'name': f'Camera {camera_id} - Connection failed',
+                'enabled': False,
+                'connection_failed': True,
+                'connection_error': msg,
+                'connection_url': remote.pretty_camera_url(local_config, camera=False),
+                'streaming_framerate': 1,
+                'framerate': 1,
+            }
+            if self.current_user in ['admin', 'peer']:
+                entry['remote_verify'] = local_config.get('@remote_verify', True)
+            cameras.append(entry)
 
         else:
             resp.remote_ui_config['id'] = camera_id
@@ -483,6 +501,8 @@ class ConfigHandler(BaseHandler):
         proto = self.get_argument('proto', None)
         discovery_in_query = bool(proto and 'proto' in self.request.query_arguments)
         if discovery_in_query:
+            # discovery connects to the given address, so a link must not start it
+            self.refuse_navigation()
             logging.warning(
                 'camera discovery via query string is not recommended because it may expose credentials; '
                 'use POST body instead'
@@ -771,20 +791,24 @@ class ConfigHandler(BaseHandler):
 
                     old_timeout = settings.SMTP_TIMEOUT
                     settings.SMTP_TIMEOUT = 10
-                    sendmail.send_mail(
-                        data['smtp_server'],
-                        int(data['smtp_port']),
-                        data['smtp_account'],
-                        data['smtp_password'],
-                        data['smtp_tls'],
-                        data['from'],
-                        data['addresses'].split(','),
-                        subject=subject,
-                        message=message,
-                        files=[],
-                    )
+                    try:
+                        sendmail.send_mail(
+                            data['smtp_server'],
+                            int(data['smtp_port']),
+                            data['smtp_account'],
+                            data['smtp_password'],
+                            data['smtp_tls'],
+                            data['from'],
+                            data['addresses'].split(','),
+                            subject=subject,
+                            message=message,
+                            files=[],
+                            verify=utils.verify_setting(data.get('smtp_verify')),
+                        )
 
-                    settings.SMTP_TIMEOUT = old_timeout
+                    finally:
+                        settings.SMTP_TIMEOUT = old_timeout
+
                     logging.debug('notification email test succeeded')
                     return self.finish_json()
 
@@ -798,7 +822,15 @@ class ConfigHandler(BaseHandler):
                         msg = str(e)
 
                     msg_lower: str = msg.lower()
-                    if 'tls' in msg_lower:
+                    if isinstance(e, ssl.SSLCertVerificationError):
+                        reason = getattr(e, 'verify_message', e)
+                        msg = (
+                            f'certificate check failed ({reason}); turn off Verify '
+                            'certificate only for a server with a self-signed '
+                            'certificate that you trust'
+                        )
+
+                    elif 'tls' in msg_lower:
                         msg = 'TLS might be required'
 
                     elif 'authentication' in msg_lower:
@@ -885,16 +917,29 @@ class ConfigHandler(BaseHandler):
             raise HTTPError(400, 'cannot test features on this type of camera')
 
     @BaseHandler.auth(admin=True)
-    def authorize(self):
+    async def authorize(self, camera_id):
+        # a new link replaces the pending verifier, so a link must not create one
+        self.refuse_navigation()
+
         service_name = self.get_argument('service')
         if not service_name:
             raise HTTPError(400, 'service_name required')
 
-        url = uploadservices.get_authorize_url(service_name)
+        if camera_id not in config.get_camera_ids():
+            raise HTTPError(404, 'no such camera')
+
+        camera_config = config.get_camera(camera_id)
+        if utils.is_remote_camera(camera_config):
+            # the remote redeems the key, so it has to create the link with the code
+            # verifier it keeps
+            url = await remote.get_authorize_url(camera_config, service_name)
+
+        else:
+            url = uploadservices.get_authorize_url(service_name)
         if not url:
             raise HTTPError(
                 400, f'no authorization url for upload service {service_name}'
             )
 
-        logging.debug(f'redirected to authorization url {url}')
-        self.redirect(url)
+        # motionEye's page opens the tab itself, and a hub passes the link on
+        self.finish_json({'url': url})

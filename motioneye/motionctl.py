@@ -17,11 +17,8 @@ from __future__ import annotations
 
 import logging
 import re
-from errno import ECHILD, ESRCH
-from os import WNOHANG, kill, waitpid
 from os.path import exists, join
-from signal import SIGKILL, SIGTERM
-from subprocess import DEVNULL, CalledProcessError, Popen
+from subprocess import DEVNULL, CalledProcessError, Popen, TimeoutExpired
 from time import sleep
 
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError, HTTPRequest
@@ -30,16 +27,19 @@ from tornado.ioloop import IOLoop
 from motioneye import mediafiles, settings, update, utils
 from motioneye.controls.powerctl import PowerControl
 
-_MOTION_CONTROL_TIMEOUT = 5
+_MOTION_CONTROL_TIMEOUT: int = 5
 
-_started = False
-_motion_binary_cache = None
-_motion_detected: dict = {}
+_started: bool = False
+# the motion process is a child of motionEye, so no pid file is needed to find it
+_process: Popen | None = None
+_motion_binary_cache: tuple[str, str] | None = None
+_motion_detected: dict[int, bool] = {}
+_motion_detection: dict[int, utils.GetMotionDetectionResult] = {}
 
 
 def find_motion():
     global _motion_binary_cache
-    if _motion_binary_cache:
+    if _motion_binary_cache is not None:
         return _motion_binary_cache
 
     # binary
@@ -76,14 +76,12 @@ def find_motion():
 
 
 def start(deferred=False):
-    from motioneye import config, mjpgclient
+    from motioneye import config, mjpgclient, wsswitch
 
     if deferred:
-        io_loop = IOLoop.current()
-        io_loop.add_callback(start, deferred=False)
+        IOLoop.current().add_callback(start, deferred=False)
 
-    global _started
-
+    global _started, _process, _motion_detection
     _started = True
 
     enabled_local_motion_cameras = config.get_enabled_local_motion_cameras()
@@ -99,7 +97,6 @@ def start(deferred=False):
     logging.debug(f'starting motion executable "{binary}" version "{version}"')
 
     motion_cfg_path = join(settings.CONF_PATH, 'motion.conf')
-    motion_pid_path = join(settings.RUN_PATH, 'motion.pid')
 
     args = [binary, '-n', '-c', motion_cfg_path, '-d']
 
@@ -137,11 +134,12 @@ def start(deferred=False):
         if exit_code is not None and exit_code != 0:
             raise RuntimeError(f'motion failed to start with exit code "{exit_code}"')
 
-    pid = process.pid
+    _process = process
 
-    # write the pid to file
-    with open(motion_pid_path, 'w') as f:
-        f.write(str(pid) + '\n')
+    # Clear motion detection status cache to cover start() without stop() from server._motion_checker
+    _motion_detection = {}
+    # motion starts with the configured state, which wsswitch has to check again
+    wsswitch.clear_cache()
 
     # disable motion detection if version < 4.4, otherwise the new "pause" setting does
     if not is_motion_post43():
@@ -157,9 +155,11 @@ def start(deferred=False):
 def stop(invalidate=False):
     from motioneye import mjpgclient
 
-    global _started
-
+    global _started, _motion_detection
     _started = False
+
+    # Clear motion detection status cache
+    _motion_detection = {}
 
     if not running():
         return
@@ -168,154 +168,139 @@ def stop(invalidate=False):
 
     mjpgclient.close_all(invalidate=invalidate)
 
-    pid = _get_pid()
-    if pid is not None:
-        try:
-            # send the TERM signal once
-            kill(pid, SIGTERM)
+    # send the TERM signal once
+    _process.terminate()
 
-            # wait 5 seconds for the process to exit
-            for _i in range(50):
-                waitpid(pid, WNOHANG)
-                sleep(0.1)
+    # wait 5 seconds for the process to exit
+    try:
+        _process.wait(5)
+        return
 
-            # send the KILL signal once
-            kill(pid, SIGKILL)
+    except TimeoutExpired:
+        pass
 
-            # wait 2 seconds for the process to exit
-            for _i in range(20):
-                sleep(0.1)
-                waitpid(pid, WNOHANG)
+    # send the KILL signal once
+    _process.kill()
 
-            # the process still did not exit
-            if settings.ENABLE_REBOOT:
-                logging.error('could not terminate the motion process')
-                PowerControl.reboot()
+    # wait 2 seconds for the process to exit
+    try:
+        _process.wait(2)
+        return
 
-            else:
-                raise RuntimeError('could not terminate the motion process')
+    except TimeoutExpired:
+        pass
 
-        except OSError as e:
-            if e.errno not in (ESRCH, ECHILD):
-                raise
+    # the process still did not exit
+    if settings.ENABLE_REBOOT:
+        logging.error('could not terminate the motion process')
+        PowerControl.reboot()
+
+    else:
+        raise RuntimeError('could not terminate the motion process')
 
 
 def running():
-    pid = _get_pid()
-    if pid is None:
-        return False
-
-    try:
-        waitpid(pid, WNOHANG)
-        kill(pid, 0)
-
-        # the process is running
-        return True
-
-    except OSError as e:
-        if e.errno not in (ESRCH, ECHILD):
-            raise
-
-    return False
+    return _process is not None and _process.poll() is None
 
 
 def started():
     return _started
 
 
+def _control_request(path: str) -> HTTPRequest:
+    username, _, password = settings.MOTION_CONTROL_AUTHENTICATION.partition(':')
+
+    return HTTPRequest(
+        f'http://127.0.0.1:{settings.MOTION_CONTROL_PORT}/{path}',
+        connect_timeout=_MOTION_CONTROL_TIMEOUT,
+        request_timeout=_MOTION_CONTROL_TIMEOUT,
+        auth_username=username or None,
+        auth_password=password or None,
+        auth_mode='basic',
+    )
+
+
 async def get_motion_detection(camera_id) -> utils.GetMotionDetectionResult:
-    motion_camera_id = camera_id_to_motion_camera_id(camera_id)
+    if _motion_detection.get(camera_id) is not None:
+        return _motion_detection[camera_id]
+
+    error: str | None = None
+    motion_camera_id: int | None = camera_id_to_motion_camera_id(camera_id)
     if motion_camera_id is None:
-        error = f'could not find motion camera id for camera with id {camera_id}'
+        error = f'could not find motion camera id for camera {camera_id}'
         logging.error(error)
         return utils.GetMotionDetectionResult(None, error=error)
 
-    url = f'http://127.0.0.1:{settings.MOTION_CONTROL_PORT}/{motion_camera_id}/detection/status'
+    request = _control_request(f'{motion_camera_id}/detection/status')
+    try:
+        resp = await AsyncHTTPClient().fetch(request, raise_error=False)
+        if resp.error:
+            error = utils.pretty_http_error(resp)
 
-    request = HTTPRequest(
-        url,
-        connect_timeout=_MOTION_CONTROL_TIMEOUT,
-        request_timeout=_MOTION_CONTROL_TIMEOUT,
-    )
-    resp = await AsyncHTTPClient().fetch(request)
-    if resp.error:
-        return utils.GetMotionDetectionResult(None, error=utils.pretty_http_error(resp))
+        elif resp.body.startswith(b'Bad Request'):
+            error = resp.body.decode(errors='replace')
 
-    resp_body = resp.body.decode('utf-8')
-    enabled = bool(resp_body.lower().count('active'))
+    except HTTPClientError as e:
+        error = str(e)
+
+    if error is not None:
+        error = (
+            f"failed to obtain motion detection status for camera {camera_id}: {error}"
+        )
+        logging.error(error)
+        return utils.GetMotionDetectionResult(None, error=error)
+
+    resp_body: str = resp.body.decode()
+    enabled: bool = bool(resp_body.lower().count('active'))
 
     logging.debug(
-        f"motion detection is {['disabled', 'enabled'][enabled]} for camera with id {camera_id}"
+        f"motion detection is {['disabled', 'enabled'][enabled]} for camera {camera_id}"
     )
+    _motion_detection[camera_id] = utils.GetMotionDetectionResult(enabled, None)
+    return _motion_detection[camera_id]
 
-    return utils.GetMotionDetectionResult(enabled, None)
 
-
-async def set_motion_detection(camera_id, enabled):
-    motion_camera_id = camera_id_to_motion_camera_id(camera_id)
+async def set_motion_detection(camera_id: int, state: str) -> str | None:
+    error: str | None = None
+    motion_camera_id: int | None = camera_id_to_motion_camera_id(camera_id)
     if motion_camera_id is None:
-        logging.error(f'could not find motion camera id for camera with id {camera_id}')
+        error = f'could not find motion camera id for camera {camera_id}'
+        logging.error(error)
+        return error
 
-        return
+    if state not in ('start', 'pause'):
+        error = f'invalid argument {state!r}'
+        logging.error(error)
+        return error
 
-    if not enabled:
+    if state == 'pause':
         _motion_detected[camera_id] = False
 
-    logging.debug(
-        f"{['disabling', 'enabling'][enabled]} motion detection for camera with id {camera_id}"
+    stat = state.removesuffix('e')
+    logging.debug(f'{stat}ing motion detection for camera {camera_id}')
+
+    request = _control_request(f'{motion_camera_id}/detection/{state}')
+    try:
+        resp = await AsyncHTTPClient().fetch(request, raise_error=False)
+        if resp.error:
+            error = utils.pretty_http_error(resp)
+
+        elif resp.body.startswith(b'Bad Request'):
+            error = resp.body.decode(errors='replace')
+
+    except HTTPClientError as e:
+        error = str(e)
+
+    if error is not None:
+        error = f'failed to {state} motion detection for camera {camera_id}: {error}'
+        logging.error(error)
+        return error
+
+    logging.debug(f"successfully {stat}ed motion detection for camera {camera_id}")
+    _motion_detection[camera_id] = utils.GetMotionDetectionResult(
+        state == 'start', None
     )
-
-    url = f"http://127.0.0.1:{settings.MOTION_CONTROL_PORT}/{motion_camera_id}/detection/{['pause', 'start'][enabled]}"
-
-    request = HTTPRequest(
-        url,
-        connect_timeout=_MOTION_CONTROL_TIMEOUT,
-        request_timeout=_MOTION_CONTROL_TIMEOUT,
-    )
-    resp = await AsyncHTTPClient().fetch(request)
-    if resp.error:
-        logging.error(
-            'failed to {} motion detection for camera with id {}: {}'.format(
-                ['disable', 'enable'][enabled],
-                camera_id,
-                utils.pretty_http_error(resp),
-            )
-        )
-
-    else:
-        logging.debug(
-            f"successfully {['disabled', 'enabled'][enabled]} motion detection for camera with id {camera_id}"
-        )
-
-    return
-
-
-async def take_snapshot(camera_id):
-    motion_camera_id = camera_id_to_motion_camera_id(camera_id)
-    if motion_camera_id is None:
-        logging.error(f'could not find motion camera id for camera with id {camera_id}')
-
-        return
-
-    logging.debug(f'taking snapshot for camera with id {camera_id}')
-
-    url = f'http://127.0.0.1:{settings.MOTION_CONTROL_PORT}/{motion_camera_id}/action/snapshot'
-
-    request = HTTPRequest(
-        url,
-        connect_timeout=_MOTION_CONTROL_TIMEOUT,
-        request_timeout=_MOTION_CONTROL_TIMEOUT,
-    )
-    resp = await AsyncHTTPClient().fetch(request)
-    if resp.error:
-        logging.error(
-            f'failed to take snapshot for camera with id {camera_id}: {utils.pretty_http_error(resp)}'
-        )
-
-    else:
-        logging.debug(f'successfully took snapshot for camera with id {camera_id}')
-
-    return
+    return None
 
 
 async def trigger_action(camera_id: int, action: str) -> str | None:
@@ -328,11 +313,7 @@ async def trigger_action(camera_id: int, action: str) -> str | None:
 
     logging.debug(f'triggering {action!r} action for camera {camera_id}')
 
-    request = HTTPRequest(
-        f'http://127.0.0.1:{settings.MOTION_CONTROL_PORT}/{motion_camera_id}/action/{action}',
-        connect_timeout=_MOTION_CONTROL_TIMEOUT,
-        request_timeout=_MOTION_CONTROL_TIMEOUT,
-    )
+    request = _control_request(f'{motion_camera_id}/action/{action}')
     try:
         resp = await AsyncHTTPClient().fetch(request, raise_error=False)
         if resp.error:
@@ -359,10 +340,10 @@ def is_motion_detected(camera_id):
 
 def set_motion_detected(camera_id, motion_detected):
     if motion_detected:
-        logging.debug(f'marking motion detected for camera with id {camera_id}')
+        logging.debug(f'marking motion detected for camera {camera_id}')
 
     else:
-        logging.debug(f'clearing motion detected for camera with id {camera_id}')
+        logging.debug(f'clearing motion detected for camera {camera_id}')
 
     _motion_detected[camera_id] = motion_detected
 
@@ -499,19 +480,5 @@ async def _disable_initial_motion_detection():
             continue
 
         if not camera_config['@motion_detection']:
-            logging.debug(
-                f'motion detection disabled by config for camera with id {camera_id}'
-            )
-            await set_motion_detection(camera_id, False)
-
-
-def _get_pid():
-    motion_pid_path = join(settings.RUN_PATH, 'motion.pid')
-
-    # read the pid from file
-    try:
-        with open(motion_pid_path) as f:
-            return int(f.readline().strip())
-
-    except (OSError, ValueError):
-        return None
+            logging.debug(f'motion detection disabled by config for camera {camera_id}')
+            await set_motion_detection(camera_id, 'pause')

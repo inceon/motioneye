@@ -61,6 +61,7 @@ _UI = {
     'email_notifications_smtp_account': '007',
     'email_notifications_smtp_password': 'p;w%d FAKE-1234',
     'email_notifications_smtp_tls': True,
+    'email_notifications_smtp_verify': True,
     'email_notifications_from': '',
     'email_notifications_addresses': 'a@example,b@example',
     'email_notifications_picture_time_span': 5,
@@ -71,12 +72,15 @@ _UI = {
     'web_hook_notifications_enabled': True,
     'web_hook_notifications_http_method': 'POSTj',
     'web_hook_notifications_url': _MOTION_URL,
+    'web_hook_notifications_verify': True,
     'web_hook_end_notifications_enabled': True,
     'web_hook_end_notifications_http_method': 'GET',
     'web_hook_end_notifications_url': _END_URL,
+    'web_hook_end_notifications_verify': True,
     'web_hook_storage_enabled': True,
     'web_hook_storage_http_method': 'POSTj',
     'web_hook_storage_url': _STORAGE_URL,
+    'web_hook_storage_verify': True,
     'command_notifications_enabled': True,
     'command_notifications_exec': _CUSTOM,
 }
@@ -90,6 +94,7 @@ _STORED = {
     'email_notifications_smtp_account': '007',
     'email_notifications_smtp_password': 'p;w%d FAKE-1234',
     'email_notifications_smtp_tls': 'True',
+    'email_notifications_smtp_verify': 'True',
     'email_notifications_from': '',
     'email_notifications_addresses': 'a@example,b@example',
     'email_notifications_picture_time_span': '5',
@@ -235,6 +240,38 @@ class ConfigTest(_ConfigCase):
                     for value in _HIDDEN:
                         self.assertNotIn(value, line)
 
+    def test_a_webhook_with_the_check_off_carries_the_flag_on_its_line(self):
+        off = {'web_hook_end_notifications_verify': False}
+        off['web_hook_storage_verify'] = False
+        data = self._save(**dict(_UI, **off))
+
+        hook = _find_command('webhook')
+        storage = f"{hook} --no-verify 'POSTj' '{_STORAGE_URL}'"
+        expected = dict(
+            _new_lines(),  # the start hook keeps its check, and its line
+            on_event_end=f"{_RELAY} stop %t; {hook} --no-verify 'GET' '{_END_URL}'",
+            on_movie_end=f'{_RELAY} movie_end %t %f; {storage}',
+            on_picture_save=f'{_RELAY} picture_save %t %f; {storage}',
+        )
+        self.assertEqual(expected, {option: data[option] for option in expected})
+
+    def test_a_post_without_the_verify_keys_keeps_the_stored_choice(self):
+        ui = config.motion_camera_dict_to_ui(self.camera)
+        ui.update(_UI)
+        off = {name: False for name in _UI if name.endswith('_verify')}
+        stored_off = config.motion_camera_ui_to_dict(dict(ui, **off), self.camera)
+        for name in off:  # a client that does not know the keys
+            del ui[name]
+
+        for stored, expected in ((self.camera, _new_lines()), (stored_off, stored_off)):
+            with self.subTest(stored_off=stored is stored_off):
+                data = config.motion_camera_ui_to_dict(dict(ui), stored)
+
+                self.assertEqual(
+                    {option: expected[option] for option in _new_lines()},
+                    {option: data[option] for option in _new_lines()},
+                )
+
     def test_a_storage_webhook_url_with_a_quote_is_refused(self):
         ui = config.motion_camera_dict_to_ui(self.camera)
         ui.update(_UI, web_hook_storage_url="http://hooks.example/a'b")
@@ -258,6 +295,109 @@ class ConfigTest(_ConfigCase):
 
         got = self._get()
         self.assertEqual(ui, {name: got[name] for name in ui})
+
+    def test_a_mail_check_turned_off_is_stored_in_the_camera_file(self):
+        data = self._save(**dict(_UI, email_notifications_smtp_verify=False))
+
+        # the switch is read from the camera file, motion's line does not change
+        self.assertEqual('False', data['@email_notifications_smtp_verify'])
+        expected = _new_lines()
+        self.assertEqual(expected, {option: data[option] for option in expected})
+
+    def test_a_post_without_the_mail_verify_key_keeps_the_stored_choice(self):
+        ui = config.motion_camera_dict_to_ui(self.camera)
+        ui.update(_UI)
+        del ui['email_notifications_smtp_verify']  # a client that does not know it
+        stored_off = dict(self.camera, **{'@email_notifications_smtp_verify': 'False'})
+
+        for stored, expected in ((self.camera, 'True'), (stored_off, 'False')):
+            with self.subTest(stored=expected):
+                data = config.motion_camera_ui_to_dict(dict(ui), stored)
+
+                self.assertEqual(expected, data['@email_notifications_smtp_verify'])
+                lines = _new_lines()
+                self.assertEqual(lines, {option: data[option] for option in lines})
+
+    def test_the_encryption_is_stored_as_older_versions_read_it(self):
+        # STARTTLS stays True, which a 0.44 remote behind a newer hub reads as STARTTLS
+        ui = config.motion_camera_dict_to_ui(self.camera)
+        ui.update(_UI)
+        for value, expected in (
+            (False, 'False'),
+            (True, 'True'),
+            ('implicit', 'implicit'),
+        ):
+            with self.subTest(value=value):
+                ui['email_notifications_smtp_tls'] = value
+                data = config.motion_camera_ui_to_dict(dict(ui), self.camera)
+
+                self.assertEqual(expected, data['@email_notifications_smtp_tls'])
+
+    def test_the_encryption_survives_a_round_trip_through_the_camera_file(self):
+        self._write(1, self.camera)
+        for value, line in ((False, 'False'), (True, 'True'), ('implicit', 'implicit')):
+            with self.subTest(value=value):
+                ui = dict(self._get(), **_UI)
+                ui['email_notifications_smtp_tls'] = value
+                self._post(ui)
+                text = self._read(1)
+                self.assertIn(f'\n# @email_notifications_smtp_tls {line}\n', text)
+
+                got = self._get()
+                self.assertEqual(value, got['email_notifications_smtp_tls'])
+                self.assertIs(type(value), type(got['email_notifications_smtp_tls']))
+                self._post(got)
+                self.assertEqual(text, self._read(1))
+
+    def test_the_mail_check_survives_a_round_trip_through_the_camera_file(self):
+        off = dict(_UI, email_notifications_smtp_verify=False)
+        self._write(1, self.camera)
+        self._post(dict(self._get(), **off))
+        text = self._read(1)
+        self.assertIn('\n# @email_notifications_smtp_verify False\n', '\n' + text)
+
+        got = self._get()
+        self.assertIs(False, got['email_notifications_smtp_verify'])
+        self._post(got)
+        self.assertEqual(text, self._read(1))
+
+    def test_a_file_without_the_mail_verify_key_shows_the_check_on(self):
+        data = self._save(**_UI)
+        del data['@email_notifications_smtp_verify']  # as older releases saved it
+        self._write(1, data)
+
+        self.assertNotIn('smtp_verify', self._read(1))
+        self.assertIs(True, self._get()['email_notifications_smtp_verify'])
+
+    def test_an_off_word_in_the_file_turns_the_mail_check_off(self):
+        words = {'off': False, 'no': False, '0': False, 'False': False}
+        words.update({'on': True, 'yes': True, 'True': True})  # edited by hand
+        data = self._save(**_UI)
+        for word, expected in words.items():
+            with self.subTest(word=word):
+                data['@email_notifications_smtp_verify'] = word
+                self._write(1, data)
+
+                text = self._read(1)
+                self.assertIn(f'\n# @email_notifications_smtp_verify {word}\n', text)
+                self.assertIs(expected, self._get()['email_notifications_smtp_verify'])
+
+    def test_the_flag_survives_a_round_trip_through_the_camera_file(self):
+        off = {'web_hook_notifications_verify': False}
+        off['web_hook_storage_verify'] = False
+        self._write(1, self.camera)
+        self._post(dict(self._get(), **dict(_UI, **off)))
+        text = self._read(1)
+        self.assertIn(" --no-verify 'POSTj' ", text)
+        self.assertNotIn(" --no-verify 'GET' ", text)
+
+        got = self._get()
+        self.assertIs(False, got['web_hook_notifications_verify'])
+        self.assertIs(True, got['web_hook_end_notifications_verify'])
+        self.assertIs(False, got['web_hook_storage_verify'])
+
+        self._post(got)
+        self.assertEqual(text, self._read(1))
 
     def test_cache_equals_the_file(self):
         self._write(1, self.camera)
@@ -287,10 +427,34 @@ class ConfigTest(_ConfigCase):
 
         got = self._get()
         self.assertEqual(hooks, {name: got[name] for name in hooks})
+        self.assertIs(True, got['email_notifications_smtp_verify'])  # sent back as is
+        self.assertIs(True, got['web_hook_notifications_verify'])
         self.assertFalse(_ha_sets_webhook(got, 'notifications', _MOTION_URL))
         self.assertFalse(_ha_sets_webhook(got, 'storage', _STORAGE_URL))
 
         self._post(got)
+        self.assertEqual(text, self._read(1))
+        self.assertEqual(got, self._get())
+
+    def test_a_home_assistant_update_keeps_the_check_off(self):
+        hooks = {  # what Home Assistant sets
+            'web_hook_notifications_enabled': True,
+            'web_hook_notifications_http_method': 'POSTj',
+            'web_hook_notifications_url': _MOTION_URL,
+            'web_hook_storage_enabled': True,
+            'web_hook_storage_http_method': 'POSTj',
+            'web_hook_storage_url': _STORAGE_URL,
+        }
+        off = {'web_hook_notifications_verify': False}
+        off['web_hook_storage_verify'] = False
+        self._write(1, self.camera)
+        self._post(dict(self._get(), **hooks, **off))  # the user turned the check off
+        text = self._read(1)
+
+        got = self._get()
+        self.assertEqual(off, {name: got[name] for name in off})
+
+        self._post(dict(got, **hooks))  # Home Assistant sets its webhooks again
         self.assertEqual(text, self._read(1))
         self.assertEqual(got, self._get())
 
@@ -299,7 +463,7 @@ class ConfigTest(_ConfigCase):
         self._post(dict(self._get(), **_UI))
         lines = self._read(1).splitlines()
         stored = [line for line in lines if line.startswith(_STORED_LINES)]
-        self.assertEqual(11, len(stored))
+        self.assertEqual(12, len(stored))
 
         off = {'email_notifications_enabled': False}
         off['telegram_notifications_enabled'] = False
@@ -412,6 +576,18 @@ class SenderTest(_ConfigCase):
         on_message('message', [])
         return self.send_telegram.call_args.args[:2]
 
+    def _write_stored(self, stored):
+        # camera-1.conf with these '# @name value' lines, read by the next event
+        config.invalidate()
+        lines = [f'# @{name} {value}'.rstrip() for name, value in stored.items()]
+        self._write_text(1, '\n'.join(['netcam_url rtsp://example/', *lines, '']))
+
+    def _stored_mail(self):
+        # the positional arguments send_mail() gets for _STORED
+        sender = f'motionEye on {socket.gethostname()} <a@example>'
+        to = ['a@example', 'b@example']
+        return ('smtp.example', 587, '007', 'p;w%d FAKE-1234', True, sender, to)
+
     def test_email_reads_the_camera_config(self):
         sent = self._mail('-c', _CONF, '1', _EVENT)
 
@@ -419,9 +595,48 @@ class SenderTest(_ConfigCase):
         to = ['a@example', 'b@example']
         expected = ('smtp.example', 587, '007', 'p;w%d FAKE-1234', True, sender, to)
         self.assertEqual(expected, sent)
+        self.assertIs(True, self.send_mail.call_args.kwargs['verify'])
         subject, _, camera_id, moment, timespan, _ = self.make_mail.call_args.args
         self.assertEqual(sendmail.subjects['motion_start'], subject)
         self.assertEqual((1, datetime(2026, 1, 1), 5), (camera_id, moment, timespan))
+
+    def test_a_stored_off_value_turns_the_mail_check_off(self):
+        for word in ('False', 'off'):  # saved in the UI, or edited by hand
+            with self.subTest(word=word):
+                self._write_stored(dict(_STORED, email_notifications_smtp_verify=word))
+                sent = self._mail('-c', _CONF, '1', _EVENT)
+
+                self.assertEqual(self._stored_mail(), sent)  # the rest is unchanged
+                self.assertIs(False, self.send_mail.call_args.kwargs['verify'])
+
+    def test_the_stored_encryption_reaches_send_mail(self):
+        # saved in the UI, or edited by hand
+        for word, expected in (
+            ('False', False),
+            ('True', True),
+            ('true', True),
+            ('implicit', 'implicit'),
+        ):
+            with self.subTest(word=word):
+                self._write_stored(dict(_STORED, email_notifications_smtp_tls=word))
+                sent = self._mail('-c', _CONF, '1', _EVENT)
+
+                self.assertEqual(expected, sent[4])
+                self.assertEqual(self._stored_mail()[5:], sent[5:])
+
+    def test_a_file_from_an_older_release_still_sends(self):
+        stored = dict(_STORED)
+        del stored['email_notifications_smtp_verify']  # what older releases wrote
+        self._write_stored(stored)
+        with self.assertLogs(level='DEBUG') as logs:
+            sent = self._mail('-c', _CONF, '1', _EVENT)
+
+        # the missing key must not read as "no email settings": the check is on
+        self.assertEqual(self._stored_mail(), sent)
+        self.assertIs(True, self.send_mail.call_args.kwargs['verify'])
+        output = '\n'.join(logs.output)
+        self.assertNotIn('has no email settings', output)
+        self.assertNotIn('ERROR:', output)
 
     def test_telegram_reads_the_camera_config(self):
         sent = self._telegram('-c', _CONF, '-l', '1', _EVENT)
@@ -500,6 +715,12 @@ class SenderTest(_ConfigCase):
 
         self.assertEqual('123456:FAKE-token', sent[0])
         self.assertNotIn('FAKE-token', '\n'.join(logs.output))
+
+    def test_mail_debug_log_shows_the_check(self):
+        with self.assertLogs(level='DEBUG') as logs:
+            self._mail('-c', _CONF, '1', _EVENT)
+
+        self.assertIn('DEBUG:root:verify = true', logs.output)
 
 
 if __name__ == '__main__':

@@ -21,6 +21,7 @@ import hashlib
 import logging
 import os
 import re
+import ssl
 import subprocess
 import time
 from collections import namedtuple
@@ -38,7 +39,7 @@ from tornado.httputil import parse_cookie
 from tornado.ioloop import IOLoop
 from tornado.web import HTTPError
 
-from motioneye.settings import CONF_PATH, VALIDATE_CERTS
+from motioneye import settings
 
 _SPECIAL_COOKIE_NAMES = {'expires', 'domain', 'path', 'secure', 'httponly'}
 
@@ -74,6 +75,7 @@ GetMotionDetectionResult = namedtuple('GetMotionDetectionResult', ('enabled', 'e
 @dataclass
 class GetCurrentPictureResponse:
     motion_detected: bool = False
+    motion_detection: bool | None = None
     capture_fps: Any = None
     monitor_info: Any = None
     picture: Any = None
@@ -319,7 +321,7 @@ def build_digest_header(method, url, username, password, state):
     s += time.ctime().encode('utf-8')
     s += os.urandom(8)
 
-    cnonce = hashlib.sha1(s).hexdigest()[:16]  # nosec B324
+    cnonce = hashlib.sha1(s, usedforsecurity=False).hexdigest()[:16]
     if _algorithm == 'MD5-SESS':
         HA1 = hash_utf8(f'{HA1}:{nonce}:{cnonce}')
 
@@ -349,19 +351,29 @@ def build_digest_header(method, url, username, password, state):
     return f'Digest {base}'
 
 
-def urlopen(request: Request, **kwargs) -> HTTPResponse:
+def verify_setting(value) -> bool:
+    """A "verify certificate" setting as stored in a config file or sent by
+    the UI: only an explicit off value turns the check off; a missing, empty
+    or unknown value keeps it on."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('false', 'off', '0', 'no')
+
+    return bool(value)
+
+
+def urlopen(request: Request, *, verify: bool = True, **kwargs) -> HTTPResponse:
     scheme: str = urlsplit(request.full_url).scheme
     if scheme not in ('http', 'https'):
         raise ValueError(f'Unsupported URL scheme: {scheme!r}')
 
-    if not VALIDATE_CERTS:
-        import ssl
-
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-
-        kwargs.setdefault('context', ctx)
+    if not verify:
+        # the caller's switch: no certificate or host-name check for this connection
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        kwargs['context'] = context
 
     return _urlopen(request, **kwargs)  # nosec: B310
 
@@ -376,6 +388,11 @@ def build_editable_mask_file(
     height = mask_lines[1]
     mask_lines = mask_lines[2:]
 
+    # a mask file that could not be read gives lines with no size, which the
+    # web UI sends back as they are unless the mask is edited
+    if width <= 0 or height <= 0:
+        return ''
+
     logging.debug(
         f'building editable {mask_class} mask for camera with id {camera_id} ({width}x{height})'
     )
@@ -389,7 +406,7 @@ def build_editable_mask_file(
     else:
         rx = 0
 
-    rw = width / nx  # rectangle width
+    rw = width // nx  # rectangle width
 
     # vertical rectangles
     ny = mask_height = height * MASK_WIDTH // width  # number of rectangles
@@ -416,7 +433,7 @@ def build_editable_mask_file(
         def line_index_func(y):
             return (len(mask_lines) - 1) * y / ny
 
-    rh = height / ny  # rectangle height
+    rh = height // ny  # rectangle height
 
     # draw the actual mask image content
     im = Image.new('L', (width, height), 255)  # all white
@@ -444,7 +461,7 @@ def build_editable_mask_file(
         if rx and line & 1:
             dr.rectangle((nx * rw, ny * rh, nx * rw + rx - 1, ny * rh + ry - 1), fill=0)
 
-    #    file_name = os.path.join(CONF_PATH, 'mask_%s.pgm' % camera_id)
+    #    file_name = os.path.join(settings.CONF_PATH, 'mask_%s.pgm' % camera_id)
     file_name = build_mask_file_name(camera_id, mask_class)
 
     # resize the image if necessary
@@ -466,7 +483,7 @@ def build_mask_file_name(camera_id, mask_class):
         if mask_class == 'motion'
         else f'mask_{camera_id}_{mask_class}.pgm'
     )
-    full_path = os.path.join(CONF_PATH, file_name)
+    full_path = os.path.join(settings.CONF_PATH, file_name)
 
     return full_path
 
@@ -484,9 +501,11 @@ def parse_editable_mask_file(
         f'parsing editable mask {mask_class} for camera with id {camera_id}: {file_name}'
     )
 
-    # read the image file
+    # read the image file; Image.open() only reads the header, so load the
+    # pixels here too, as a file cut short (e.g. by a full disk) fails only then
     try:
         im = Image.open(file_name)
+        im.load()
 
     except Exception as e:
         logging.error(f'failed to read mask file {file_name}: {e}')

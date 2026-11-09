@@ -42,7 +42,6 @@ from motioneye.handlers.movie import MovieHandler
 from motioneye.handlers.movie_playback import MovieDownloadHandler, MoviePlaybackHandler
 from motioneye.handlers.picture import PictureHandler
 from motioneye.handlers.power import PowerHandler
-from motioneye.handlers.prefs import PrefsHandler
 from motioneye.handlers.relay_event import RelayEventHandler
 from motioneye.utils import authstate
 
@@ -218,7 +217,6 @@ handler_mapping: Sequence[tuple] = [
         {'path': r''},
     ),
     (r'^/action/(?P<camera_id>\d+)/(?P<action>\w+)/?$', ActionHandler),
-    (r'^/prefs/(?P<key>\w+)?/?$', PrefsHandler),
     (r'^/_relay_event/?$', RelayEventHandler),
     (r'^/log/(?P<name>\w+)/?$', LogHandler),
     (r'^/power/(?P<op>shutdown|reboot)/?$', PowerHandler),
@@ -259,12 +257,6 @@ def test_requirements():
     if not os.access(settings.CONF_PATH, os.W_OK):
         logging.fatal(
             f'config directory "{settings.CONF_PATH}" does not exist or is not writable'
-        )
-        sys.exit(-1)
-
-    if not os.access(settings.RUN_PATH, os.W_OK):
-        logging.fatal(
-            f'pid directory "{settings.RUN_PATH}" does not exist or is not writable'
         )
         sys.exit(-1)
 
@@ -479,6 +471,11 @@ def run():
     # Create the Tornado application with secure cookie settings
     application = make_app(debug=False)
     application.listen(settings.PORT, settings.LISTEN)
+    # motion relays its events to 127.0.0.1 (see relayevent.sh), and the relay
+    # event API only accepts local requests, so listen there as well when the
+    # configured address does not include it
+    if settings.LISTEN not in ('', '0.0.0.0', '127.0.0.1', 'localhost'):  # nosec: B104
+        application.listen(settings.PORT, '127.0.0.1')
     logging.info(_('servilo komenciĝis'))
 
     io_loop = IOLoop.current()
@@ -519,6 +516,13 @@ def main(parser, args, command):
 
     if command == 'start':
         if options.background:
+            # only the background mode needs a pid file, to be stopped by "stopserver"
+            if not os.access(settings.RUN_PATH, os.W_OK):
+                logging.fatal(
+                    f'pid directory "{settings.RUN_PATH}" does not exist or is not writable'
+                )
+                sys.exit(-1)
+
             daemon = Daemon(
                 pid_file=os.path.join(settings.RUN_PATH, _PID_FILE), run_callback=run
             )

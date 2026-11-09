@@ -1,7 +1,13 @@
+# this file may contain credentials (see motion_control_authentication), hence
+# it should be readable by the motionEye user only, but not writable by it, so
+# that motionEye cannot change its own settings: motioneye_init applies owner
+# root:motion and mode 0640
+
 # path to the configuration directory (must be writable by motionEye)
 conf_path /etc/motioneye
 
-# path to the directory where pid files go (must be writable by motionEye)
+# path to the directory where the pid file goes, only used in background mode (-b)
+# (must be writable by motionEye then)
 run_path /run/motioneye
 
 # path to the directory where log files go (must be writable by motionEye)
@@ -26,6 +32,12 @@ listen 0.0.0.0
 # the TCP port to listen on
 port 8765
 
+# comma-separated IP addresses or networks (without quotes) of reverse proxies
+# whose X-Forwarded-For header is trusted for login rate limiting; set this when
+# behind a reverse proxy, otherwise all users share one limit; the proxy must
+# set X-Forwarded-For to include the actual client IP
+#trusted_proxies 127.0.0.1
+
 # path to the motion binary to use (automatically detected if commented)
 #motion_binary /usr/bin/motion
 
@@ -35,6 +47,12 @@ motion_control_localhost true
 
 # the TCP port that motion HTTP control interface listens on
 motion_control_port 7999
+
+# the credentials (username:password) required by motion HTTP control interface
+# (basic authentication), disabled if commented; recommended when
+# motion_control_localhost is false, as the interface is otherwise open to the
+# network
+#motion_control_authentication username:password
 
 # interval in seconds at which motionEye checks if motion is running
 motion_check_interval 10

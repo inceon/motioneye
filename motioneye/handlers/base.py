@@ -47,6 +47,20 @@ def session_expiry_seconds(user_type: str) -> int:
     return _SESSION_EXPIRY_SECONDS
 
 
+def get_session_id(handler: RequestHandler):
+    """Return the session id from the signed "user" cookie.
+
+    Tornado rejects signed cookies older than 31 days by default, while the
+    surveillance user session can last longer, so the cookie is accepted as
+    long as the longest session lasts; the session store still checks the
+    lifetime of each user type.
+    """
+    max_age_days = (
+        max(session_expiry_seconds('admin'), session_expiry_seconds('normal')) / 86400
+    )
+    return handler.get_signed_cookie('user', max_age_days=max_age_days)
+
+
 def create_session(user_type):
     """Create a secure session id with expiry."""
     session_id = token_hex(32)
@@ -147,6 +161,20 @@ class BaseHandler(RequestHandler):
         content = template.render(template_name, **context)
         self.finish(content)
 
+    def refuse_navigation(self):
+        # the session cookie is SameSite=Lax, so it comes along when another site
+        # links here: such a navigation asks for text/html, motionEye's own requests
+        # do not, and a hub's neither; to HTTPS and localhost, browsers also
+        # say so in Sec-Fetch-*
+        headers = self.request.headers
+        site = headers.get('Sec-Fetch-Site')
+        if (
+            headers.get('Sec-Fetch-Mode') == 'navigate'
+            or (site is not None and site != 'same-origin')
+            or 'text/html' in headers.get('Accept', '')
+        ):
+            raise HTTPError(403, 'this cannot be started by opening a link')
+
     def finish_json(self, data=None):
         if data is None:
             data = {}
@@ -155,7 +183,7 @@ class BaseHandler(RequestHandler):
 
     def get_current_user(self):
         # Check for session-based authentication (via secure cookie)
-        session_id = self.get_signed_cookie('user')
+        session_id = get_session_id(self)
         if session_id:
             try:
                 session_id = (

@@ -31,7 +31,8 @@ STATIC_PATH = os.path.join(PROJECT_PATH, 'static')
 # path to the configuration directory (must be writable by motionEye)
 CONF_PATH = [sys.prefix, ''][sys.prefix == '/usr'] + '/etc/motioneye'
 
-# path to the directory where pid files go (must be writable by motionEye)
+# path to the directory where the pid file goes, only used in background mode (-b)
+# (must be writable by motionEye then)
 for d in ['/run', '/var/run']:
     if os.path.exists(d):
         RUN_PATH = d
@@ -67,6 +68,9 @@ LISTEN = '0.0.0.0'  # nosec: B104
 # the TCP port to listen on
 PORT = 8765
 
+# comma-separated proxy IPs or networks trusted by the login rate limiter
+TRUSTED_PROXIES: str = ''
+
 # path to the motion binary to use (automatically detected by default)
 MOTION_BINARY = None
 
@@ -76,6 +80,10 @@ MOTION_CONTROL_LOCALHOST = True
 
 # the TCP port that motion HTTP control interface listens on
 MOTION_CONTROL_PORT = 7999
+
+# the credentials (username:password) required by motion HTTP control interface
+# (basic authentication), empty to disable authentication
+MOTION_CONTROL_AUTHENTICATION = ''
 
 # interval in seconds at which motionEye checks if motion is running
 MOTION_CHECK_INTERVAL = 10
@@ -129,9 +137,6 @@ TIMELAPSE_TIMEOUT = 500
 
 # enable adding and removing cameras from UI
 ADD_REMOVE_CAMERAS = True
-
-# enable HTTPS certificate validation
-VALIDATE_CERTS = True
 
 # an external program to be executed whenever a password changes;
 # the program will be invoked with environment variables MEYE_USERNAME and MEYE_PASSWORD
