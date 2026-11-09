@@ -119,7 +119,9 @@ def _post(path: str, body: bytes, content_type: str, retry: bool) -> None:
     _post_once(path, body, content_type)
 
 
-def _photo_form(chat_id, caption: str, filename: str, field: str = 'photo') -> tuple[bytes, str]:
+def _photo_form(
+    chat_id, caption: str, filename: str, field: str = 'photo'
+) -> tuple[bytes, str]:
     boundary = token_hex(16)
     name = os.path.basename(filename).replace('"', '')
     with open(filename, 'rb') as f:
@@ -164,8 +166,14 @@ def send_message(api_key, chat_id, message, files, retry=True, movie=False):
                 field, method = 'photo', 'sendPhoto'
                 if movie:
                     if os.path.getsize(f) > 50 * 1024 * 1024:
-                        raise RuntimeError('video exceeds Telegram upload limit of 50 MB')
-                    field = 'video' if os.path.splitext(f)[1].lower() == '.mp4' else 'document'
+                        raise RuntimeError(
+                            'video exceeds Telegram upload limit of 50 MB'
+                        )
+                    field = (
+                        'video'
+                        if os.path.splitext(f)[1].lower() == '.mp4'
+                        else 'document'
+                    )
                     method = 'sendVideo' if field == 'video' else 'sendDocument'
                 body, content_type = _photo_form(chat_id, message, f, field)
                 _post(f'/bot{api_key}/{method}', body, content_type, retry)

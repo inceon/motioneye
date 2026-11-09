@@ -23,15 +23,15 @@ env.globals.update(
         ),
     ),
 )
-base = dict(
-    version='qa',
-    hostname='Camera station',
-    current_user='admin',
-    has_motion=True,
-    add_remove_cameras=True,
-    mask_width=32,
-    static_path='/static/',
-)
+base = {
+    'version': 'qa',
+    'hostname': 'Camera station',
+    'current_user': 'admin',
+    'has_motion': True,
+    'add_remove_cameras': True,
+    'mask_width': 32,
+    'static_path': '/static/',
+}
 (output / 'main.html').write_text(
     env.get_template('main.html').render(**base, frame=False)
 )

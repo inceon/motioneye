@@ -160,7 +160,9 @@ class SendMessageTest(unittest.TestCase):
 
             self.pictures.append(path)
 
-    def _send(self, replies, message='message', files=(), chat_id=42, retry=True, movie=False):
+    def _send(
+        self, replies, message='message', files=(), chat_id=42, retry=True, movie=False
+    ):
         self.sleeps = []
         self.connections = []
         replies = list(replies)
@@ -171,7 +173,9 @@ class SendMessageTest(unittest.TestCase):
             ),
             patch('motioneye.sendtelegram.time.sleep', side_effect=self.sleeps.append),
         ):
-            sendtelegram.send_message(_TOKEN, chat_id, message, list(files), retry, movie=movie)
+            sendtelegram.send_message(
+                _TOKEN, chat_id, message, list(files), retry, movie=movie
+            )
 
     def test_sends_mp4_as_video_and_other_formats_as_documents(self):
         for extension, method, field in (
@@ -180,13 +184,18 @@ class SendMessageTest(unittest.TestCase):
             ('avi', 'sendDocument', 'document'),
         ):
             with self.subTest(extension=extension):
-                path = os.path.join(os.path.dirname(self.pictures[1]), f'front door.{extension}')
+                path = os.path.join(
+                    os.path.dirname(self.pictures[1]), f'front door.{extension}'
+                )
                 with open(path, 'wb') as f:
                     f.write(b'video data')
                 self._send([_OK], files=[path], movie=True)
                 request = self.connections[0].request_args
                 self.assertEqual(f'/bot{_TOKEN}/{method}', request[1])
-                self.assertEqual((os.path.basename(path), b'video data'), _form_fields(request)[field])
+                self.assertEqual(
+                    (os.path.basename(path), b'video data'),
+                    _form_fields(request)[field],
+                )
                 self.assertTrue(self.connections[0].closed)
 
     def test_refuses_oversized_video_before_upload(self):
